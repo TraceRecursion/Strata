@@ -39,6 +39,21 @@ int main() {
     std::istringstream broken("MemAvailable: 123 kB\n");
     broken.setstate(std::ios::badbit);
     check(!conversation_mem_available(broken), "I/O failure declines admission");
+    // The commit budget is MemAvailable plus SwapFree, and unknown when either reading is missing.
+    std::istringstream commit_normal("MemTotal: 999999 kB\nMemAvailable:    12345 kB\nSwapFree: 777 kB\n");
+    check(conversation_mem_commit(commit_normal) == (12345ULL + 777ULL) * 1024,
+          "commit is MemAvailable plus SwapFree");
+    std::istringstream commit_no_swap("MemAvailable: 12345 kB\nSwapFree: 0 kB\n");
+    check(conversation_mem_commit(commit_no_swap) == 12345ULL * 1024,
+          "a machine with no swap still reports a known commit budget");
+    for (const char* text : {"MemAvailable: 1 kB\n", "SwapFree: 1 kB\n",
+                             "MemAvailable: 1 MB\nSwapFree: 2 kB\n",
+                             "MemAvailable: 1 kB\nSwapFree: 2 kB\nSwapFree: 3 kB\n",
+                             "MemAvailable: 18446744073709551615 kB\nSwapFree: 1 kB\n",
+                             "MemAvailable: 18014398509481983 kB\nSwapFree: 18014398509481983 kB\n"}) {
+        std::istringstream input(text);
+        check(!conversation_mem_commit(input), "an incomplete, malformed or overflowing commit reading is unknown");
+    }
     check(!conversation_memory_admit({}, 0, 0), "unknown fails closed even with zero floor");
     check(conversation_memory_admit(100, 40, 60), "exact allocation plus floor fits");
     check(!conversation_memory_admit(99, 40, 60), "one byte below required memory rejected");
@@ -49,9 +64,11 @@ int main() {
                                    std::numeric_limits<uint64_t>::max(), 0), "maximal exact bound");
     check(!conversation_memory_admit(std::numeric_limits<uint64_t>::max(),
                                     std::numeric_limits<uint64_t>::max(), 1), "maximal sum overflow rejected");
-    // Test the real provider without assuming any particular amount of free RAM.
+    // Test the real providers without assuming any particular amount of free RAM.
     const auto available = conversation_available_memory();
     check(!available || conversation_memory_admit(available, 0, 0), "provider returns bytes or unknown");
+    const auto commit = conversation_available_commit();
+    check(!commit || conversation_memory_admit(commit, 0, 0), "commit provider returns bytes or unknown");
 #if defined(_WIN32)
     // Unknown must fail closed in production, but must not let a broken Windows provider pass this test.
     // Compare with total physical memory, not a second available reading: other processes can allocate
@@ -61,6 +78,8 @@ int main() {
     check(GlobalMemoryStatusEx(&physical) != 0, "Windows physical-memory API is available");
     check(available.has_value() && *available <= physical.ullTotalPhys,
           "Windows provider returns a known, physically bounded sample");
+    check(commit.has_value() && *commit <= physical.ullTotalPageFile,
+          "Windows commit provider returns a known, commit-bounded sample");
 #endif
     std::printf("conversation_memory_test: %d checks passed\n", checks);
 }

@@ -272,6 +272,23 @@ public:
         return true;
     }
 
+    // Drop the least recently active entry that does not hold a pinned shared prefix, whatever the byte
+    // budget says.  A parked conversation is charged against commit as well as against budget_, and commit
+    // is bounded by RAM plus the page-file total - so a budget_ larger than that headroom lets the cache
+    // fill up and then refuse EVERY park.  make_room cannot help there: it stops as soon as the byte budget
+    // is satisfied, and the byte budget is not what ran out.  Returns the bytes released, 0 when only
+    // pinned entries remain.
+    size_t drop_least_recent() {
+        auto victim = std::find_if(entries_.begin(), entries_.end(),
+                                   [](const SavedConversation& e) { return !e.pinned(); });
+        if (victim == entries_.end()) return 0;
+        const size_t released = victim->bytes();
+        bytes_ -= released;
+        entries_.erase(victim);
+        ++evictions_;
+        return released;
+    }
+
     // #342: drop the parked entries an outgoing conversation (its live tokens and checkpoint chain) supersedes:
     // the same conversation a turn back, whose DEEPEST checkpoint the outgoing chain still holds, so all it adds
     // is the tail the client rewrote (the reply as it was generated, before the next request re-rendered it) and
