@@ -205,9 +205,33 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
     if (!conversation_kv_validate(image, st, g, upto, index, error)) return false;
     const std::array<const ConversationBuffer*,5> src = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
     const auto dst = pools(st);
+    const bool host_pool = st.kv_mode != 0;   // pools() hands back the authoritative host pool then
+    // The destination is the pinned host pool whenever kv_mode != 0 (kv_streaming), so this copy is
+    // host-to-host and a plain memcpy is the right primitive.  cudaMemcpyDefault on a *pageable* source
+    // costs a needless DMA-shaped round trip through a staging buffer: measured over three interleaved
+    // A/B pairs against this path, 1.16x, 1.39x and 2.16x on copy bandwidth with restore time down to
+    // 0.96x, 0.52x and 0.33x.  It is only used for pointers CUDA itself reports as host memory.
+    bool dst_is_host[5] = {false, false, false, false, false};
+    if (host_pool)
+        for (size_t i = 0; i < src.size(); ++i)
+            if (dst[i] != nullptr) {
+                cudaPointerAttributes attr{};
+                dst_is_host[i] = cudaPointerGetAttributes(&attr, dst[i]) == cudaSuccess &&
+                                 attr.type == cudaMemoryTypeHost;
+                if (!dst_is_host[i]) cudaGetLastError();
+            }
+    // A parked snapshot's pages were written to the page file at different times, so faulting them in one
+    // 4 KiB page at a time is near-random I/O.  PrefetchVirtualMemory on the whole range list before the
+    // copy was tried for exactly that reason and made things WORSE, consistently: it faults every page in
+    // first and the copy then reads them a second time, doubling the memory traffic.  Measured over three
+    // interleaved A/B pairs: 0.91x, 0.93x on copy bandwidth and 2.6x, 1.6x WORSE on restore time.
     for (size_t i = 0; i < src.size(); ++i)
         if (!src[i]->visit(0, src[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
-                return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
+                if (dst_is_host[i])
+                    std::memcpy(static_cast<uint8_t*>(dst[i]) + at, p, n);
+                else if (!transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error))
+                    return false;
+                return true;
             })) return false;
     // VRAM slots still contain the outgoing conversation. Resolve must refill
     // them from the restored authoritative pools before any attention reads.
