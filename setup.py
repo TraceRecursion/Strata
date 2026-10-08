@@ -1280,6 +1280,12 @@ def find_vcvars(cuda_v=None):
     upper = "19.0" if cuda_v is not None and tuple(cuda_v) >= (13, 3) else "18.0"
     p = out([str(vswhere), "-latest", "-products", "*", "-version", f"[16.0,{upper})", "-requires",
              "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"]).strip()
+    if not p:
+        # An Insiders install (2026 = 18) is a prerelease instance: vswhere hides it unless asked.  A stable
+        # instance, when there is one, stays the first choice, so this only runs as a fallback.
+        p = out([str(vswhere), "-latest", "-prerelease", "-products", "*", "-version", f"[16.0,{upper})",
+                 "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                 "-property", "installationPath"]).strip()
     v = Path(p) / "VC/Auxiliary/Build/vcvars64.bat" if p else None
     return v if v and v.exists() else None
 
