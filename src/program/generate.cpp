@@ -591,6 +591,11 @@ struct Options {
     int64_t conversation_cache_mib = 0; // opt-in host RAM for independent conversations
     int conversation_cache_slots = 4;
     int64_t conversation_cache_min_free_mib = 2560;
+    /// --serve: which budget the parking admission and that floor read.  "physical" (the default) parks a
+    /// conversation only when its snapshot fits in free physical RAM right now, so the OS never has to page
+    /// a parked conversation out; "commit" admits against the commit headroom instead and lets the OS page
+    /// parked conversations out to the page file (conversation_memory.hpp).
+    std::string conversation_cache_admit = "physical";
     /// --serve SAVE: disk space a session file must leave free where it is written (MiB; 0 = no check)
     int64_t session_min_free_mib = 4096;
     /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
@@ -733,8 +738,13 @@ void usage() {
                  "                       of RAM each; 0 = read every prompt from the start)\n"
                  "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default 0 = off)\n"
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
-                 "  --conversation-cache-min-free-mib N  --serve: physical RAM floor when parking or restoring a\n"
-                 "                       session file (default 2560)\n"
+                 "  --conversation-cache-min-free-mib N  --serve: RAM floor when parking or restoring a session\n"
+                 "                       file, in whichever budget --conversation-cache-admit reads (default 2560)\n"
+                 "  --conversation-cache-admit physical|commit  --serve: which budget that floor and the parking\n"
+                 "                       admission read.  physical (default) needs the snapshot to fit in free physical\n"
+                 "                       RAM now; commit admits against the commit headroom (RAM + page file) and lets\n"
+                 "                       the OS page parked conversations out - they are cold by construction, and the\n"
+                 "                       engine's hot host memory is locked, so it cannot be taken in their place\n"
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
                  "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
                  "                       default 512), so the command `VRAM <reserve_mib>` (the server's POST /v1/vram) can\n"
@@ -1828,6 +1838,14 @@ int main(int argc, char** argv) {
             else if (a == "--session-min-free-mib") o.session_min_free_mib = number;
             else o.conversation_cache_slots = (int) number;
         }
+        else if (a == "--conversation-cache-admit") {
+            const std::string value = next("--conversation-cache-admit");
+            if (value != "physical" && value != "commit") {
+                std::fprintf(stderr, "--conversation-cache-admit takes physical or commit\n");
+                return 2;
+            }
+            o.conversation_cache_admit = value;
+        }
         else if (a == "--prompt-cache-tail") o.prompt_cache_tail = true;
         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
         else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));
@@ -1968,6 +1986,9 @@ int main(int argc, char** argv) {
     if (o.serve && o.conversation_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_cache_slots == 0))
         std::fprintf(stderr, "strata serve: warning: conversation caching is disabled by %s\n",
                      o.prompt_cache == 0 ? "--prompt-cache 0" : "--conversation-cache-slots 0");
+    if (o.serve && o.conversation_cache_admit == "commit" && o.conversation_cache_mib == 0)
+        std::fprintf(stderr, "strata serve: warning: --conversation-cache-admit commit has no effect without "
+                             "--conversation-cache-mib\n");
     // parking with --layer-split saves every stage (SavedConversation::stage_images)
     // Layer split (multi-GPU): the later stages run layers [K_i, K_i+1) on their own GPUs (--split-device, default
     // the next visible ones); "auto" places the K from each GPU's free VRAM once the weights are in (below).  KV
@@ -7125,33 +7146,41 @@ int main(int argc, char** argv) {
                 const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
                 const size_t retained = reuse.bytes() + stage_retained;
                 const size_t additional = estimate > retained ? estimate - retained : 0;
-                // The physical-RAM gate: the incoming snapshot has to fit beside the floor.  make_room()
+                const bool pageable = o.conversation_cache_admit == "commit";
+                // The admission gate: the incoming snapshot has to fit beside the floor.  make_room()
                 // above only balanced the cache's own budget, so a full cache leaves this one short even
-                // though every parked conversation could give its RAM back - and refusing here throws
+                // though every parked conversation could give its memory back - and refusing here throws
                 // away the whole prompt read that produced this snapshot (measured: 270k tokens, 96 s).
                 // Evict the least recently active parked conversations until it fits, or until none are
                 // left.  Each ConversationBuffer is a list of 16 MiB segments, each segment its own
-                // allocation, so an evicted entry is back with the kernel before the next check reads
-                // /proc/meminfo; no waiting is needed.  slots() bounds the loop, and the two lines
-                // below say what it did either way.
+                // allocation, so an evicted entry is back with the kernel before the next check reads the
+                // telemetry; no waiting is needed.  slots() bounds the loop, and the two lines below say
+                // what it did either way.
+                // Which budget it reads is --conversation-cache-admit: free physical RAM by default, or
+                // the commit headroom, under which the OS is allowed to page a parked conversation out
+                // rather than the engine refusing to park it at all.
                 size_t evicted = 0;
                 auto admit = [&] {
                     return strata::core::conversation_memory_admit(
-                        strata::core::conversation_available_memory(), additional, floor);
+                        pageable ? strata::core::conversation_available_commit()
+                                 : strata::core::conversation_available_memory(),
+                        additional, floor);
                 };
                 while (!admit() && conversations.size() > 0 && evicted < conversations.slots() &&
                        conversations.evict_oldest())
                     ++evicted;
                 if (!admit()) {
-                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor; evicted %zu, %zu still parked, or telemetry unavailable)\n",
-                                 additional >> 20, (long long) o.conversation_cache_min_free_mib,
+                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (%s admission; need %zu MiB plus %lld MiB floor; evicted %zu, %zu still parked, or telemetry unavailable)\n",
+                                 pageable ? "commit" : "physical RAM", additional >> 20,
+                                 (long long) o.conversation_cache_min_free_mib,
                                  evicted, conversations.size());
                     return true;
                 }
                 if (evicted)
-                    std::fprintf(stderr, "strata serve: conversation cache: evicted %zu parked conversation%s to admit this snapshot (%zu MiB plus %lld MiB floor)\n",
+                    std::fprintf(stderr, "strata serve: conversation cache: evicted %zu parked conversation%s to admit this snapshot (%zu MiB plus %lld MiB floor, %s)\n",
                                  evicted, evicted == 1 ? "" : "s", additional >> 20,
-                                 (long long) o.conversation_cache_min_free_mib);
+                                 (long long) o.conversation_cache_min_free_mib,
+                                 pageable ? "commit" : "physical RAM");
                 strata::core::SavedConversation image;
                 size_t reused_bytes = 0;
                 if (!strata::core::conversation_snapshot_save(image, view, ss, g, draft0, err,
@@ -7167,8 +7196,11 @@ int main(int argc, char** argv) {
                         return false;
                     image.stage_images.push_back(std::move(part));
                 }
-                if (!strata::core::conversation_memory_admit(strata::core::conversation_available_memory(), 0, floor)) {
-                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM floor after capture, or telemetry unavailable)\n");
+                if (!strata::core::conversation_memory_admit(
+                        pageable ? strata::core::conversation_available_commit()
+                                 : strata::core::conversation_available_memory(), 0, floor)) {
+                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (%s floor after capture, or telemetry unavailable)\n",
+                                 pageable ? "commit" : "physical RAM");
                     return true;
                 }
                 const size_t snapshot_bytes = image.bytes();
@@ -8043,7 +8075,8 @@ int main(int argc, char** argv) {
                         "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
                         "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
-                        "conversation_cache_min_free_mib=%lld tail_role_token=%lld vram_elastic=%d%s engine=" STRATA_VERSION "\n",
+                        "conversation_cache_min_free_mib=%lld conversation_cache_admit=%s "
+                        "tail_role_token=%lld vram_elastic=%d%s engine=" STRATA_VERSION "\n",
                         (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
                                          ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
@@ -8054,7 +8087,8 @@ int main(int argc, char** argv) {
                         (long long) ((o.mmap_experts ? src.resident_bytes() : strata::kernels::cpu::expert_layout().total) >> 20),
                         pool.workers(), o.pcie_frac,
                         o.spec_min_p, (long long) o.conversation_cache_mib, o.conversation_cache_slots,
-                        (long long) o.conversation_cache_min_free_mib, (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
+                        (long long) o.conversation_cache_min_free_mib, o.conversation_cache_admit.c_str(),
+                        (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
                         o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
                                        " batch_groups=" + std::to_string(o.batch_groups)).c_str() : "");
@@ -8786,7 +8820,14 @@ int main(int argc, char** argv) {
                         }
                         const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
                         auto admit = [&](uint64_t need, std::string& why) {
-                            const auto avail = strata::core::conversation_available_memory();
+                            // The same telemetry the conversation cache's parking admission reads.  With
+                            // --conversation-cache-admit commit the operator has said the commit headroom is
+                            // the resource that matters; a save refused for want of free physical RAM while
+                            // gigabytes of commit sit unused is the inconsistency that made this path
+                            // unusable on a machine whose engine deliberately holds ~53 GiB resident.
+                            const auto avail = o.conversation_cache_admit == "commit"
+                                                   ? strata::core::conversation_available_commit()
+                                                   : strata::core::conversation_available_memory();
                             if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
                             why = "not enough RAM to save the session (" +
                                   (need == UINT64_MAX ? std::string("unknown") : std::to_string(need >> 20)) +
@@ -8844,7 +8885,10 @@ int main(int argc, char** argv) {
                         limits.progress = moving;
                         const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
                         limits.admit = [floor, &o](uint64_t need, std::string& why) {
-                            const auto avail = strata::core::conversation_available_memory();
+                            // same telemetry choice as the save path above, and as parking
+                            const auto avail = o.conversation_cache_admit == "commit"
+                                                   ? strata::core::conversation_available_commit()
+                                                   : strata::core::conversation_available_memory();
                             if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
                             why = "not enough RAM to read it (" + std::to_string(need >> 20) + " MiB plus a floor of " +
                                   std::to_string((long long) o.conversation_cache_min_free_mib) + " MiB needed, " +
