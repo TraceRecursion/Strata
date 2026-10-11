@@ -65,7 +65,7 @@ int main() {
     check(!conversation_memory_admit(std::numeric_limits<uint64_t>::max(),
                                     std::numeric_limits<uint64_t>::max(), 1), "maximal sum overflow rejected");
     // Test the real providers without assuming any particular amount of free RAM.
-    const auto available = conversation_available_memory();
+    const auto available = available_host_bytes();
     check(!available || conversation_memory_admit(available, 0, 0), "provider returns bytes or unknown");
     const auto commit = conversation_available_commit();
     check(!commit || conversation_memory_admit(commit, 0, 0), "commit provider returns bytes or unknown");
