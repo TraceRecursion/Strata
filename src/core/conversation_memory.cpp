@@ -252,6 +252,19 @@ std::optional<uint64_t> conversation_mem_available(std::istream& meminfo) {
     return meminfo_kb_bytes(meminfo, "MemAvailable:");
 }
 
+// The commit budget: MemAvailable plus SwapFree, unknown when either reading is missing or the sum overflows.
+// A machine with no swap reports `SwapFree: 0 kB`, which is a measurement and not a missing one.  The second
+// pass rewinds the same stream: the callers hand in a file or a fixture, both seekable.
+std::optional<uint64_t> conversation_mem_commit(std::istream& meminfo) {
+    const std::optional<uint64_t> available = conversation_mem_available(meminfo);
+    if (!available) return {};
+    meminfo.clear();
+    meminfo.seekg(0);
+    const std::optional<uint64_t> swap = meminfo_kb_bytes(meminfo, "SwapFree:");
+    if (!swap || *available > std::numeric_limits<uint64_t>::max() - *swap) return {};
+    return *available + *swap;
+}
+
 void set_memory_limit_bytes(uint64_t bytes) { g_memory_limit_bytes.store(bytes, std::memory_order_relaxed); }
 uint64_t memory_limit_bytes() { return g_memory_limit_bytes.load(std::memory_order_relaxed); }
 
@@ -295,6 +308,21 @@ std::optional<uint64_t> available_host_bytes() {
     const auto reading = sample_host_memory();
     if (!reading) return {};
     return reading->available;
+}
+
+std::optional<uint64_t> conversation_available_commit() {
+#if defined(_WIN32)
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof status;
+    if (GlobalMemoryStatusEx(&status)) return status.ullAvailPageFile;
+    return {};
+#elif defined(__linux__)
+    std::ifstream meminfo("/proc/meminfo");
+    if (!meminfo) return {};
+    return conversation_mem_commit(meminfo);
+#else
+    return {};
+#endif
 }
 
 } // namespace strata::core

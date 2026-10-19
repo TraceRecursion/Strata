@@ -334,9 +334,12 @@ public:
 
     // The parked conversation that has gone unused the longest.  This is make_room()'s loop body, so
     // the parking path can also free RAM one entry at a time on demand (see the physical-RAM admission
-    // gate in generate.cpp).  A ConversationBuffer is a list of 16 MiB segments and each segment is its
-    // own allocation, far above glibc's mmap threshold, so dropping an entry returns the whole footprint
-    // to the kernel at once - the next admission check reads it back from /proc/meminfo.
+    // gate in generate.cpp); the same eviction serves the commit-headroom gate that
+    // --conversation-cache-admit commit reads, because dropping an entry releases its commit charge with
+    // its RAM - a budget_ larger than that headroom would otherwise fill the cache and refuse EVERY park.
+    // A ConversationBuffer is a list of 16 MiB segments and each segment is its own allocation, far above
+    // glibc's mmap threshold, so dropping an entry returns the whole footprint to the kernel at once - the
+    // next admission check reads it back from /proc/meminfo.
     // False when none can go (empty, or only entries that hold a pinned shared prefix are left).
     bool evict_oldest() {
         // the oldest entry that holds no pinned shared prefix and is not the guarded (borrowed) donor
@@ -363,7 +366,6 @@ public:
 
     // The slot count, so a caller that evicts in a loop has a bound it did not invent.
     size_t slots() const { return slots_; }
-
     // #342: drop the parked entries an outgoing conversation (its live tokens and checkpoint chain) supersedes:
     // the same conversation a turn back, whose DEEPEST checkpoint the outgoing chain still holds, so all it adds
     // is the tail the client rewrote (the reply as it was generated, before the next request re-rendered it) and
