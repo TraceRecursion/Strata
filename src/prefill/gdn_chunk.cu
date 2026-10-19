@@ -10,6 +10,7 @@
 // registers - the chunk-serial scan of the reference's fwd kernel).  The per-chunk 64x64 matrices A and P are
 // computed once per (chunk, head) by the kkt kernel and read by the four column slices.
 #include "strata/prefill/gdn_chunk.hpp"
+#include "strata/core/die_now.hpp"
 
 #include <cuda_runtime.h>
 #if !defined(__HIPCC__)
@@ -40,7 +41,7 @@ void check(const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "gdn_chunk %s: %s\n", what, cudaGetErrorString(e));
-        std::exit(1);
+        strata::core::die_now(1);
     }
 }
 
@@ -470,7 +471,7 @@ struct Ws {
             std::fprintf(stderr, "gdn_chunk: workspace alloc failed (%zu chunks, device %d, %.1f of %.1f MiB free): %s\n",
                          chunks, dev, (double) fb / 1048576.0, (double) tb / 1048576.0,
                          cudaGetErrorString(cudaGetLastError()));
-            std::exit(1);
+            strata::core::die_now(1);
         }
     }
     ~Ws() {
@@ -533,7 +534,7 @@ void gdn_chunk_recurrence(float* state, const float* h, const float* gate, const
 #if defined(__HIPCC__)
     (void) state; (void) h; (void) gate; (void) beta; (void) oc; (void) T; (void) stream;
     std::fprintf(stderr, "gdn_chunk_recurrence: not built for HIP\n");
-    std::exit(1);
+    strata::core::die_now(1);
 #else
     if (T <= 0) return;
     const int64_t T64 = T - T % CH;

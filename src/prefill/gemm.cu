@@ -1,5 +1,6 @@
 // src/prefill/gemm.cu - see include/strata/prefill/gemm.hpp.
 #include "strata/prefill/gemm.hpp"
+#include "strata/core/die_now.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 #if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
 #include "strata/prefill/moe_mmq.hpp"
@@ -108,7 +109,7 @@ void gemm_set_f16_range(bool on) {
     const int v = on ? 1 : 0;
     if (cudaMemcpyToSymbol(g_f16_range_on_g, &v, sizeof v) != cudaSuccess) {
         std::fprintf(stderr, "prefill gemm: setting the FP16 range check failed: %s\n", cudaGetErrorString(cudaGetLastError()));
-        std::exit(1);
+        strata::core::die_now(1);
     }
 #else
     (void) on;
@@ -136,7 +137,7 @@ namespace {
 void ck(cublasStatus_t s, const char* what) {
     if (s != CUBLAS_STATUS_SUCCESS) {
         std::fprintf(stderr, "prefill gemm: %s: cuBLAS status %d\n", what, (int) s);
-        std::exit(1);
+        strata::core::die_now(1);
     }
 }
 
@@ -150,7 +151,7 @@ void absorb_hipblas_sticky(const char* what) {
     const hipError_t sticky = hipGetLastError();
     if (sticky == hipSuccess || sticky == hipErrorInvalidValue) return;
     std::fprintf(stderr, "prefill gemm: %s left %s\n", what, hipGetErrorString(sticky));
-    std::exit(1);
+    strata::core::die_now(1);
 }
 #define STRATA_ABSORB_HIPBLAS_STICKY(what) absorb_hipblas_sticky(what)
 #else
@@ -387,7 +388,7 @@ bool try_hipblaslt(void* opaque_state, strata::prefill::hipblaslt::InputType typ
     std::fprintf(stderr, "prefill gemm: hipBLASLt launch failed with status %d\n", (int) status);
     if (beta != 0.0f) {
         std::fprintf(stderr, "prefill gemm: refusing a fallback after hipBLASLt failed with nonzero beta\n");
-        std::exit(1);
+        strata::core::die_now(1);
     }
     auto* mutable_state = static_cast<HipLtState*>(opaque_state);
     uint32_t beta_bits = 0;
@@ -936,9 +937,9 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
 #if defined(__HIPCC__)
     if (f16_io_) {   // X is the FP16 image (set_act_f16); W goes through the dequantization scratch as FP16
         // the only accumulating BF16 product is the BF16X2 low part, which bf16x2_mode() turns off with this path
-        if (beta != 0.0f) { std::fprintf(stderr, "prefill gemm: an accumulating BF16 GEMM on the FP16 prompt path\n"); std::exit(1); }
+        if (beta != 0.0f) { std::fprintf(stderr, "prefill gemm: an accumulating BF16 GEMM on the FP16 prompt path\n"); strata::core::die_now(1); }
         const int64_t rows = std::min<int64_t>(N, scratch_elems_ / K);
-        if (rows <= 0) { std::fprintf(stderr, "prefill gemm: scratch too small for K=%lld\n", (long long) K); std::exit(1); }
+        if (rows <= 0) { std::fprintf(stderr, "prefill gemm: scratch too small for K=%lld\n", (long long) K); strata::core::die_now(1); }
         for (int64_t r0 = 0; r0 < N; r0 += rows) {
             const int64_t n = std::min(rows, N - r0);
             bf16_to_f16_rows<<<1024, 256, 0, (cudaStream_t) stream_>>>(W + r0 * K, (__half*) scratch_, n * K);
@@ -987,7 +988,7 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
                                  "(Pascal cards run the BF16 products through them); free VRAM on this card: raise "
                                  "--vram-reserve-mib, lower --max-context or --kv-resident, or give it fewer layers\n",
                          "FP32", (long long) N, (long long) K);
-            std::exit(1);
+            strata::core::die_now(1);
         }
         if (fit) {
             for (int64_t n0 = 0; n0 < N; n0 += w_rows) {
@@ -1027,7 +1028,7 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
         const int64_t x_rows = std::max<int64_t>(1, std::min<int64_t>(T, kXSliceElems / K));
         if (!grow(tc_x_, tc_x_elems_, x_rows * K)) {
             std::fprintf(stderr, "prefill gemm: no GPU memory for converting an FP16 image back to BF16\n");
-            std::exit(1);
+            strata::core::die_now(1);
         }
         for (int64_t t0 = 0; t0 < T; t0 += x_rows) {
             const int64_t n = std::min<int64_t>(x_rows, T - t0);
@@ -1261,7 +1262,7 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
 #endif
         std::fprintf(stderr, "prefill gemm: a padded X (ldx %lld, K %lld) needs STRATA_PF_PAD's path\n",
                      (long long) ldx, (long long) K);
-        std::exit(1);
+        strata::core::die_now(1);
     }
 #if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
     if (beta == 0.0f && (ldx == 0 || ldx == K) && native_mmq(X, ggml_type, W_blocks, Y, T, N, K, ldy)) return;
@@ -1269,7 +1270,7 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
     if (N * K > scratch_elems_) {
         // Too large for the scratch at once: in row slices.
         const int64_t rows = scratch_elems_ / K;
-        if (rows <= 0) { std::fprintf(stderr, "prefill gemm: scratch too small for K=%lld\n", (long long) K); std::exit(1); }
+        if (rows <= 0) { std::fprintf(stderr, "prefill gemm: scratch too small for K=%lld\n", (long long) K); strata::core::die_now(1); }
         if (ldy <= 0) ldy = N;
         for (int64_t r0 = 0; r0 < N; r0 += rows) {
             const int64_t n = (N - r0 < rows) ? N - r0 : rows;
