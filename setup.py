@@ -1873,6 +1873,10 @@ def find_vcvars(cuda_v=None):
         args += ["-version", f"[16.0,{upper})"]
     args += ["-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"]
     p = out(args).strip()
+    if not p:
+        # An Insiders install (2026 = 18) is a prerelease instance: vswhere hides it unless asked.  A stable
+        # instance, when there is one, stays the first choice, so this only runs as a fallback.
+        p = out(args[:2] + ["-prerelease"] + args[2:]).strip()
     v = Path(p) / "VC/Auxiliary/Build/vcvars64.bat" if p else None
     return v if v and v.exists() else None
 
