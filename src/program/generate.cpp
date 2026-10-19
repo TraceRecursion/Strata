@@ -25,6 +25,7 @@
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/conversation_snapshot.hpp"
+#include "strata/core/die_now.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_memory.hpp"
@@ -13774,7 +13775,7 @@ int main(int argc, char** argv) {
                 const bool win = windows_ok(at, to);
                 if (win && !refill(err)) {
                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
-                    return 1;
+                    strata::core::die_now(1);
                 }
                 // a read going on in a planned segment gets the loan it was read with (what is left would size
                 // another, and the loan decides which experts are read in place: bits)
@@ -13782,7 +13783,7 @@ int main(int argc, char** argv) {
                                               ? resume_plan.lend : 0;
                 if (!win && !lend(to - at, err, plan_lend)) {
                     std::printf("ERR lending the prompt path its slots failed: %s\n", err.c_str());
-                    return 1;
+                    strata::core::die_now(1);
                 }
                 if (win) merge_at = merge_from(at, to);   // (after the refill: the loans are back)
                 const int64_t read_to = merge_at >= 0 ? merge_at : to;   // (merge_at > at: the part's windows before it)
@@ -13840,7 +13841,7 @@ int main(int argc, char** argv) {
             }
             if (!refill(err)) {
                 std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
-                return 1;
+                strata::core::die_now(1);
             }
             if (o.prefill_head_alias) {
                 sp.reset();
