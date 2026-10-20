@@ -25,6 +25,7 @@
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/conversation_snapshot.hpp"
+#include "strata/core/conversation_arena.hpp"
 #include "strata/core/die_now.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/session_save_reclaim.hpp"
@@ -722,6 +723,12 @@ struct Options {
     /// conversation_cache_slots whatever its length, so without it a client that interleaves short side requests
     /// with one long conversation evicts the long one (oldest first).  0 = park every conversation.
     int64_t conversation_cache_min_tokens = 0;
+    /// --conversation-cache-dir: the directory whose strata-arena.{1..5}.bin files a parked conversation's K/V
+    /// segments are mapped into, instead of the heap (empty: the heap, as before).  See
+    /// docs/CONVERSATION_CACHE_ARENA.md.
+    std::string conversation_cache_dir;
+    /// --conversation-cache-arena-gib: the size of each arena file in GiB (default 8).
+    int64_t conversation_cache_arena_gib = 0;
     /// --serve: park only after the conversation has advanced this many tokens past the copy it would supersede.
     /// A conversation that moved a few hundred tokens writes a full snapshot again, and the turn after that drops it
     /// (drop_superseded) after writing the same bytes once more, so on a long single conversation every turn pays a
@@ -895,6 +902,11 @@ void usage() {
                  "                       wins; 0 = none). Parking and session save/restore keep their floor under it\n"
                  "  --conversation-cache-min-tokens N  --serve: park only conversations of at least N tokens, so\n"
                  "                       short side requests do not take the slots a long one needs (default 0 = park any)\n"
+                 "  --conversation-cache-dir FILES  --serve: keep parked conversations' K/V in mapped files, one comma-separated\n"
+                 "                       (strata-arena.{1..5}.bin, one per volume, round-robin extents) instead of the\n"
+                 "                       heap: file-backed pages do not charge commit, and a restarted engine adopts\n"
+                 "                       them (docs/CONVERSATION_CACHE_ARENA.md; default: the heap)\n"
+                 "  --conversation-cache-arena-gib N  --serve: the size of each arena file in GiB (default 8)\n"
                  "  --conversation-cache-park-gain N  --serve: park only after the conversation advanced N tokens past\n"
                  "                       the copy it would supersede, so a turn that grew by a few hundred tokens does not\n"
                  "                       write a whole snapshot that the next turn drops (default 0 = park every turn)\n"
@@ -2600,9 +2612,10 @@ int main(int argc, char** argv) {
         else if (a == "--vision") o.vision = true;
         else if (a == "--session-save-reclaim") o.session_save_reclaim = true;
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
+        else if (a == "--conversation-cache-dir") o.conversation_cache_dir = next("--conversation-cache-dir");
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
                  a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-min-tokens" ||
-                 a == "--conversation-cache-park-gain" ||
+                 a == "--conversation-cache-park-gain" || a == "--conversation-cache-arena-gib" ||
                  a == "--session-min-free-mib" || a == "--memory-limit-mib") {
             const std::string value = next(a.c_str());
             int64_t number = 0;
@@ -2618,6 +2631,7 @@ int main(int argc, char** argv) {
             else if (a == "--conversation-cache-min-free-mib") o.conversation_cache_min_free_mib = number;
             else if (a == "--conversation-cache-min-tokens") o.conversation_cache_min_tokens = number;
             else if (a == "--conversation-cache-park-gain") o.conversation_cache_park_gain = number;
+            else if (a == "--conversation-cache-arena-gib") o.conversation_cache_arena_gib = number;
             else if (a == "--session-min-free-mib") o.session_min_free_mib = number;
             else if (a == "--memory-limit-mib") o.memory_limit_mib = number;
             else o.conversation_cache_slots = (int) number;
@@ -9174,6 +9188,7 @@ int main(int argc, char** argv) {
         bool cvec_cached = true;   // the control vector's state the live session and the checkpoints were read with
         // without --mtp the conversation cache stays on: a parked image carries the draft layer's K/V only when there is one
         // (the snapshots accept a null draft)
+        std::unique_ptr<strata::core::ConversationArena> conversation_arena;   // --conversation-cache-dir
         strata::core::ConversationCache conversations(
             o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
             (size_t) o.conversation_cache_slots, o.conversation_cache_min_tokens);
@@ -9251,10 +9266,46 @@ int main(int argc, char** argv) {
             id.config = *config_fp;
             return true;
         };
+        // --conversation-cache-dir: the mapped arena the parked conversations' K/V segments live in.  Off by
+        // default; a fingerprint failure or an unavailable volume leaves the cache on the heap, with one line.
+        if (!o.conversation_cache_dir.empty() && conversations.enabled()) {
+            strata::core::SessionFileIdentity arena_id;
+            std::string why;
+            if (!session_identity(arena_id, why, nullptr)) {
+                std::fprintf(stderr, "strata serve: conversation arena: no fingerprint (%s); the cache stays in RAM\n",
+                             why.c_str());
+            } else {
+                const int64_t gib = o.conversation_cache_arena_gib > 0 ? o.conversation_cache_arena_gib : 8;
+                // One file per volume, comma separated: the arena stripes segments across whatever is listed.
+                std::vector<std::string> paths;
+                for (size_t at = 0; at < o.conversation_cache_dir.size();) {
+                    size_t comma = o.conversation_cache_dir.find(',', at);
+                    if (comma == std::string::npos) comma = o.conversation_cache_dir.size();
+                    size_t begin = at, end = comma;
+                    while (begin < end && (o.conversation_cache_dir[begin] == ' ' || o.conversation_cache_dir[begin] == '"')) ++begin;
+                    while (end > begin && (o.conversation_cache_dir[end - 1] == ' ' || o.conversation_cache_dir[end - 1] == '"')) --end;
+                    if (end > begin) paths.push_back(o.conversation_cache_dir.substr(begin, end - begin));
+                    at = comma + 1;
+                }
+                conversation_arena = strata::core::ConversationArena::open(
+                    paths, (size_t) gib * 1024ull * 1024ull * 1024ull, arena_id.model, arena_id.config, why);
+                if (conversation_arena) {
+                    const auto st = conversation_arena->stats();
+                    std::fprintf(stderr, "strata serve: conversation arena: %zu volume(s), %zu MiB in use, %zu MiB free\n",
+                                 st.volumes, st.used_bytes >> 20, st.free_bytes >> 20);
+                } else {
+                    std::fprintf(stderr, "strata serve: conversation arena: not available (%s); the cache stays in RAM\n",
+                                 why.c_str());
+                }
+            }
+        }
         // Save only on a switch/rewind, not on each continuing request. No graph
         // addresses change: all parked images live in ordinary host vectors.
         auto park_current_body = [&](size_t held) -> bool {
             if (!conversations.enabled() || !live_ok || live.empty()) return true;
+            // The parked image's K/V segments allocate from the arena when one is configured; every other
+            // allocation in this request keeps the heap (a segment's allocator is fixed at construction).
+            strata::core::ArenaAllocatorScope arena_scope(conversation_arena.get());
             // #2049: parking copies the outgoing conversation's running checkpoints and K/V into host memory, which
             // is a silent stretch of the "request" stage; when the OS has paged that memory out it takes minutes.
             // Named, so a stall report says "parking"; its copies beat (conversation_copy.hpp), so the watchdog

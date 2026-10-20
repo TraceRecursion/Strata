@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strata/core/progress.hpp"
+#include "strata/core/conversation_arena.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -123,7 +124,10 @@ public:
     }
 
 private:
-    using Segment = std::vector<uint8_t>;
+    // Segments allocate from the conversation arena when the park path set one (conversation_arena.hpp): a
+    // parked image's K/V then lives in file-backed pages instead of the heap.  Without an arena - the default -
+    // this is the plain heap, exactly as before.
+    using Segment = std::vector<uint8_t, ConversationArena::Allocator<uint8_t>>;
     // A fresh capture allocates exactly its payload. Later appends reserve
     // geometrically growing segments, bounded by 16 MiB. Small chat turns then
     // extend the final allocation instead of adding one transfer per turn.
