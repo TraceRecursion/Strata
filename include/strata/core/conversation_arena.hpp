@@ -53,6 +53,9 @@ public:
     void* allocate(size_t bytes) { ArenaExtent unused; return allocate(bytes, unused); }
     /// The mapped address `extent` starts at (valid while the arena is open).
     uint8_t* pointer(const ArenaExtent& extent) const;
+    /// Writes `extent` back to its volume now.  A park flushes each 16 MiB extent, so the dirty-page backlog
+    /// stays bounded instead of flooding RAM and evicting the engine's own working set.
+    void flush(const ArenaExtent& extent);
     /// Returns an extent obtained from allocate(); a pointer the arena does not know is ignored.
     void release(void* p);
     Stats stats() const;
