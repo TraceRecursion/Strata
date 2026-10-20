@@ -9612,8 +9612,9 @@ int main(int argc, char** argv) {
                 if (background) {
                     park_writer.finish(true);
                     std::fprintf(stderr, "strata serve: conversation cache: parked %zu tokens: the arena copy streams on "
-                                         "the background writer (%zu MiB, %zu parked now)\n",
-                                 live.size(), snapshot_bytes >> 20, conversations.size());
+                                         "the background writer (%zu MiB, built in %.1f ms, %zu parked now)\n",
+                                 live.size(), snapshot_bytes >> 20,
+                                 std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), conversations.size());
                     return true;
                 }
                 const bool stored = conversations.put(std::move(image), held);
