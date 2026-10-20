@@ -173,11 +173,11 @@ std::unique_ptr<ConversationArena> ConversationArena::open(const std::vector<std
         std::fprintf(stderr, "strata serve: conversation arena: new arena over %zu volume(s), %.1f GiB each\n",
                      arena->files_.size(), (double) file_bytes / (1024.0 * 1024.0 * 1024.0));
     } else {
-        // Adopt the on-disk table as used space so a restarted engine never hands the same extent out twice.
-        auto* table = reinterpret_cast<ArenaExtent*>(static_cast<uint8_t*>(arena->files_[0]->base) + head->table_offset);
-        for (uint64_t i = 0; i < head->extent_count; ++i) arena->live_.push_back(table[i]);
-        std::fprintf(stderr, "strata serve: conversation arena: adapted %zu volume(s), %llu extent(s) in use\n",
-                     arena->files_.size(), (unsigned long long) head->extent_count);
+        // A previous run's table.  There are no entry descriptors yet (M3), so that data cannot be used: reclaim
+        // the extents instead of adopting them, which would leak a little of the arena on every restart.
+        std::fprintf(stderr, "strata serve: conversation arena: reclaimed %llu extent(s) from a previous run\n",
+                     (unsigned long long) head->extent_count);
+        head->extent_count = 0;
     }
     // Every volume: the header at the front, the rest free.
     arena->free_.resize(arena->files_.size());

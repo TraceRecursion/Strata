@@ -62,7 +62,7 @@ int main() {
         check(arena->allocate(4 * 1024 * 1024) != nullptr, "a fitting request still works after a refusal");
     }
 
-    // 3. Identity: another config wipes the arena; the same identity keeps what is there.
+    // 3. Identity: another config wipes the arena; the same identity reclaims the old extents (until M3).
     {
         auto arena = ConversationArena::open(paths, kEach, 11, 22, err);
         check(arena->allocate(1024 * 1024) != nullptr, "an extent before the identity change");
@@ -74,7 +74,7 @@ int main() {
         check(keep != nullptr, "an extent in the new arena");
         other.reset();
         auto same = ConversationArena::open(paths, kEach, 11, 99, err);
-        check(same->stats().used_bytes >= 2 * 1024 * 1024, "the matching arena adopts what was in use");
+        check(same->stats().used_bytes == 0, "a matching arena reclaims a previous run's extents (no entry descriptors yet)");
     }
 
     // 4. ConversationBuffer: its segments come from the arena and go back when it is destroyed.
