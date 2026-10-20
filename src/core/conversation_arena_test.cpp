@@ -2,7 +2,7 @@
 // Five small files in a temporary directory stand in for the five Optane volumes.
 
 #include "strata/core/conversation_arena.hpp"
-#include "strata/core/conversation_buffer.hpp"
+#include "strata/core/conversation_cache.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -21,6 +21,15 @@ void check(bool value, const char* what) {
     if (!value) { std::fprintf(stderr, "FAIL: %s\n", what); std::exit(1); }
 }
 constexpr size_t kEach = 32ull * 1024 * 1024;   // one volume in the test
+bool holds(const ConversationBuffer& b, uint8_t value) {
+    bool same = true;
+    b.visit(0, b.size(), [&](const uint8_t* p, size_t n, size_t) {
+        for (size_t i = 0; i < n; ++i)
+            if (p[i] != value) { same = false; break; }
+        return true;
+    });
+    return same;
+}
 }  // namespace
 
 int main() {
@@ -40,10 +49,11 @@ int main() {
         const auto start = arena->stats();
         check(start.volumes == 5, "five volumes are mapped");
         const size_t want = 20 * 1024 * 1024 + 123;
-        void* p = arena->allocate(want);
-        check(p != nullptr, "a 20 MiB extent is served");
-        std::memset(p, 0x5a, want);
-        check(static_cast<uint8_t*>(p)[want - 1] == 0x5a, "the extent is writable to its end");
+        ArenaExtent extent;
+        void* p = arena->allocate(want, extent);
+        check(p != nullptr && p == arena->pointer(extent), "a 20 MiB extent is served");
+        std::memset(p, 0x5a, (size_t) extent.length);
+        check(static_cast<uint8_t*>(p)[extent.length - 1] == 0x5a, "the extent is writable to its end");
         check(arena->stats().used_bytes >= want, "the used bytes account it");
         void* q = arena->allocate(8 * 1024 * 1024);
         check(q != nullptr && q != p, "a second extent is a different range");
@@ -77,34 +87,72 @@ int main() {
         check(same->stats().used_bytes == 0, "a matching arena reclaims a previous run's extents (no entry descriptors yet)");
     }
 
-    // 4. ConversationBuffer: its segments come from the arena and go back when it is destroyed.
+    // 4. One K/V image: into the arena (the heap copies go), back out identical, and released without copying.
     {
         auto arena = ConversationArena::open(paths, kEach, 11, 22, err);
-        {
-            ArenaAllocatorScope scope(arena.get());
-            ConversationBuffer bytes;
-            bytes.resize(40 * 1024 * 1024 + 7, 0x33);
-            check(bytes.size() == 40 * 1024 * 1024 + 7, "the buffer holds its payload");
-            check(arena->stats().used_bytes >= 40 * 1024 * 1024, "the segments come from the arena");
-            bool same = true;
-            bytes.visit(0, bytes.size(), [&](const uint8_t* p, size_t n, size_t) {
-                for (size_t i = 0; i < n; ++i)
-                    if (p[i] != 0x33) { same = false; break; }
-                return true;
-            });
-            check(same, "the payload reads back");
-            ConversationBuffer copy = bytes;
-            check(copy.size() == bytes.size() && copy == bytes, "a copy inside the arena round-trips");
-        }
-        check(arena->stats().used_bytes == 0, "the buffer's extents are released with it");
+        ConversationKv kv;
+        const size_t big = 40 * 1024 * 1024 + 7, small = 1024 * 1024 + 17;
+        kv.k.resize(big, 0x01);
+        kv.v.resize(small, 0x02);
+        kv.k_scale.resize(0);
+        kv.v_scale.resize(4096, 0x03);
+        kv.pooled.resize(65536, 0x04);
+        const bool moved = conversation_kv_to_arena(kv, *arena, err);
+        if (!moved) std::fprintf(stderr, "  (to_arena: %s)\n", err.c_str());
+        check(moved, "the image moves into the arena");
+        check(kv.k.size() == 0 && kv.v.size() == 0 && kv.pooled.size() == 0, "the heap copies are freed");
+        check(kv.bytes() >= big + small + 4096 + 65536, "the cache byte accounting still counts the parked payload");
+        check(arena->stats().used_bytes >= big + small + 4096 + 65536, "the payloads are in the arena");
+        check(conversation_kv_from_arena(kv, *arena, err), "the image comes back");
+        check(kv.k.size() == big && kv.v.size() == small && kv.v_scale.size() == 4096 && kv.pooled.size() == 65536,
+              "the buffer sizes are restored");
+        check(holds(kv.k, 0x01) && holds(kv.v, 0x02) && holds(kv.v_scale, 0x03) && holds(kv.pooled, 0x04),
+              "the payload bytes survive the round trip");
+        check(arena->stats().used_bytes == 0, "the extents are released on the way back");
+        check(conversation_kv_to_arena(kv, *arena, err), "the image moves in again");
+        conversation_kv_release_arena(kv, *arena);
+        check(arena->stats().used_bytes == 0, "release frees them without a copy");
     }
 
-    // 5. Without an arena the buffer is the heap, exactly as before the feature.
+    // 5. Through the cache: put copies into the arena, take copies back, eviction frees, the budget still bounds.
     {
-        ConversationBuffer heap;
-        heap.resize(1024, 1);
-        check(heap.bytes() >= 1024, "a heap buffer needs no arena");
-        check(ConversationArena::current() == nullptr, "no arena is active by default");
+        auto arena = ConversationArena::open(paths, kEach, 11, 22, err);
+        ConversationCache cache(64ull * 1024 * 1024, 3);
+        cache.set_arena(arena.get());
+        SavedConversation image;
+        image.live.ids = {1, 2, 3};
+        image.kv.resize(2);
+        image.kv[0].k.resize(8 * 1024 * 1024, 0x11);
+        image.kv[1].v.resize(1024 * 1024, 0x22);
+        const size_t parked = image.bytes();
+        check(cache.put(std::move(image)), "the cache takes the image");
+        check(arena->stats().used_bytes >= 9 * 1024 * 1024, "its payload is in the arena, not the heap");
+        check(cache.bytes() >= parked, "the cache still counts the parked bytes against its budget");
+        SavedConversation out = cache.take(0);
+        check(out.kv.size() == 2 && out.kv[0].k.size() == 8 * 1024 * 1024 && holds(out.kv[0].k, 0x11),
+              "the taken image is materialized with its bytes");
+        check(arena->stats().used_bytes == 0, "and its extents are back");
+        check(cache.size() == 0, "the entry is gone");
+        SavedConversation again;
+        again.live.ids = {4};
+        again.kv.resize(1);
+        again.kv[0].pooled.resize(2 * 1024 * 1024, 0x33);
+        check(cache.put(std::move(again)), "a second image is parked");
+        check(cache.clear() == 1 && cache.size() == 0, "clear drops it");
+        check(arena->stats().used_bytes == 0, "and frees its extents");
+    }
+
+    // 6. Without an arena the cache is the heap, exactly as before the feature.
+    {
+        ConversationCache cache(64ull * 1024 * 1024, 2);
+        check(!cache.arena_backed(), "no arena by default");
+        SavedConversation image;
+        image.live.ids = {9};
+        image.kv.resize(1);
+        image.kv[0].k.resize(1024, 0x44);
+        check(cache.put(std::move(image)), "a heap cache parks as before");
+        SavedConversation out = cache.take(0);
+        check(out.kv[0].k.size() == 1024 && holds(out.kv[0].k, 0x44), "and takes it back unchanged");
     }
 
     fs::remove_all(dir, ec);

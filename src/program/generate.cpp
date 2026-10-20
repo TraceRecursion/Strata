@@ -9290,6 +9290,7 @@ int main(int argc, char** argv) {
                 conversation_arena = strata::core::ConversationArena::open(
                     paths, (size_t) gib * 1024ull * 1024ull * 1024ull, arena_id.model, arena_id.config, why);
                 if (conversation_arena) {
+                    conversations.set_arena(conversation_arena.get());
                     const auto st = conversation_arena->stats();
                     std::fprintf(stderr, "strata serve: conversation arena: %zu volume(s), %zu MiB in use, %zu MiB free\n",
                                  st.volumes, st.used_bytes >> 20, st.free_bytes >> 20);
@@ -9303,9 +9304,6 @@ int main(int argc, char** argv) {
         // addresses change: all parked images live in ordinary host vectors.
         auto park_current_body = [&](size_t held) -> bool {
             if (!conversations.enabled() || !live_ok || live.empty()) return true;
-            // The parked image's K/V segments allocate from the arena when one is configured; every other
-            // allocation in this request keeps the heap (a segment's allocator is fixed at construction).
-            strata::core::ArenaAllocatorScope arena_scope(conversation_arena.get());
             // #2049: parking copies the outgoing conversation's running checkpoints and K/V into host memory, which
             // is a silent stretch of the "request" stage; when the OS has paged that memory out it takes minutes.
             // Named, so a stall report says "parking"; its copies beat (conversation_copy.hpp), so the watchdog

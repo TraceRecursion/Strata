@@ -3,12 +3,15 @@
 #pragma once
 
 #include "strata/core/conversation_buffer.hpp"
+#include "strata/core/conversation_arena.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <deque>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -58,10 +61,27 @@ struct ConversationKv {
     int format = 0;
     int64_t cells = 0, heads = 0, head_dim = 0, page_size = 0, pooled_rows = 0, idx_dim = 0;
     ConversationBuffer k, v, k_scale, v_scale, pooled;
+    // When the cache keeps this image in the mapped arena (--conversation-cache-dir): the five buffers are empty and
+    // their payloads live in `arena` extents.  `size` is what the buffer held, so validate/restore still see the
+    // right lengths, and `arena_bytes` keeps the cache's byte budget counting them (the budget bounds the parked
+    // set, wherever it lives).  See docs/CONVERSATION_CACHE_ARENA.md.
+    struct ArenaPart {
+        std::vector<ArenaExtent> extents;
+        size_t size = 0;
+    };
+    std::array<ArenaPart, 5> arena{};
+    size_t arena_bytes = 0;
     size_t bytes() const {
-        return k.bytes() + v.bytes() + k_scale.bytes() + v_scale.bytes() + pooled.bytes();
+        return k.bytes() + v.bytes() + k_scale.bytes() + v_scale.bytes() + pooled.bytes() + arena_bytes;
     }
 };
+
+/// Moves a parked image's K/V payloads into the arena (the heap copies are freed) and back.  A full arena leaves
+/// the image untouched and fails, which the cache turns into a skipped park.  release frees the extents without
+/// copying anything back (eviction).
+bool conversation_kv_to_arena(ConversationKv& kv, ConversationArena& arena, std::string& error);
+bool conversation_kv_from_arena(ConversationKv& kv, ConversationArena& arena, std::string& error);
+void conversation_kv_release_arena(ConversationKv& kv, ConversationArena& arena);
 
 struct ConversationKvReuse {
     std::vector<ConversationKv> kv;
@@ -198,6 +218,11 @@ int64_t conversation_prefix(const ConversationCheckpoint& c, const std::vector<T
     return (int64_t) n;
 }
 
+/// The whole image - its K/V and, recursively, a layer split's stage images - moved into and out of the arena.
+bool conversation_image_to_arena(SavedConversation& image, ConversationArena& arena, std::string& error);
+bool conversation_image_from_arena(SavedConversation& image, ConversationArena& arena, std::string& error);
+void conversation_image_release_arena(SavedConversation& image, ConversationArena& arena);
+
 class ConversationCache {
 public:
     struct Match {
@@ -210,6 +235,10 @@ public:
     ConversationCache(size_t budget, size_t slots, int64_t min_tokens = 0)
         : budget_(budget), slots_(slots), min_tokens_(min_tokens) {}
     bool enabled() const { return budget_ != 0 && slots_ != 0; }
+    /// --conversation-cache-dir: where parked payloads live (nullptr: the heap, as before).  Called once at start;
+    /// the arena outlives the cache.
+    void set_arena(ConversationArena* arena) { arena_ = arena; }
+    bool arena_backed() const { return arena_ != nullptr; }
     /// `--conversation-cache-min-tokens`: whether a conversation of this length is worth one of `slots`.  Every
     /// parked conversation costs a whole slot whatever its length, so a client that interleaves short side requests
     /// with one long conversation spends the cache on the side requests and evicts the long one (oldest first) -
@@ -269,6 +298,13 @@ public:
         SavedConversation out = std::move(entries_.at(index));
         bytes_ -= out.bytes();
         erase(index);
+        // The payloads come back to the heap before anything reads them (validate, restore, borrow).
+        if (arena_ != nullptr) {
+            std::string error;
+            if (!conversation_image_from_arena(out, *arena_, error))
+                std::fprintf(stderr, "strata serve: conversation arena: restoring a parked image failed (%s)\n",
+                             error.c_str());
+        }
         return out;
     }
 
@@ -281,6 +317,9 @@ public:
     // shared prefix (pin=N): a borrow copies the checkpoints up to the match, and taking it instead keeps one
     // conversation holding the pin, as pin=N expects.
     bool borrows(const Match& m) const {
+        // A parked image holds no bytes in RAM when the arena keeps them, so there is nothing to borrow from: the
+        // caller takes it whole instead (slower by one copy, and correct).
+        if (arena_ != nullptr) return false;
         if (m.tokens <= 0 || m.live || m.index >= entries_.size() || serials_[m.index] != m.serial) return false;
         size_t deepest = 0;
         for (const auto& c : entries_[m.index].checkpoints) {
@@ -357,6 +396,8 @@ public:
     // may carry the poison.  Returns how many were parked.
     size_t clear() {
         const size_t n = entries_.size();
+        if (arena_ != nullptr)
+            for (auto& entry : entries_) conversation_image_release_arena(entry, *arena_);
         entries_.clear();
         serials_.clear();
         bytes_ = 0;
@@ -426,6 +467,16 @@ public:
         if (!enabled() || held > budget_ || n > budget_ - held) return false;   // make_room's refusal, first
         drop_superseded(image.live.ids, image.live.imgs, image.checkpoints, image.cvec);
         if (!make_room(n, held)) return false;
+        // The payloads move into the arena before they are stored, so the parked bytes are file-backed pages: the
+        // heap copies are freed here and the restore side copies them back.  A full arena refuses the park.
+        if (arena_ != nullptr) {
+            std::string error;
+            if (!conversation_image_to_arena(image, *arena_, error)) {
+                std::fprintf(stderr, "strata serve: conversation arena: the parked image stays in RAM (%s)\n",
+                             error.c_str());
+                return false;
+            }
+        }
         entries_.push_back(std::move(image));
         serials_.push_back(next_serial_++);
         bytes_ += n;
@@ -434,11 +485,13 @@ public:
 
 private:
     void erase(size_t index) {
+        if (arena_ != nullptr) conversation_image_release_arena(entries_[index], *arena_);
         entries_.erase(entries_.begin() + (std::ptrdiff_t) index);
         serials_.erase(serials_.begin() + (std::ptrdiff_t) index);
     }
     size_t budget_ = 0, slots_ = 0, bytes_ = 0, evictions_ = 0, superseded_ = 0, borrowed_ = 0;
     int64_t min_tokens_ = 0;   // --conversation-cache-min-tokens: 0 parks every conversation, whatever its size
+    ConversationArena* arena_ = nullptr;   // --conversation-cache-dir: where the parked payloads live
     std::deque<SavedConversation> entries_; // least recently active first
     std::deque<uint64_t> serials_;          // entries_[i]'s identity, never reused
     uint64_t next_serial_ = 1, guarded_ = 0;

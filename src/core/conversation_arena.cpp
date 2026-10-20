@@ -2,6 +2,7 @@
 // docs/CONVERSATION_CACHE_ARENA.md.
 
 #include "strata/core/conversation_arena.hpp"
+#include "strata/core/conversation_cache.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -39,8 +40,6 @@ struct Header {
     uint64_t table_offset = 4096;
 };
 
-thread_local ConversationArena* g_current = nullptr;
-
 size_t round_up(size_t n, size_t unit) { return (n + unit - 1) / unit * unit; }
 
 }  // namespace
@@ -70,14 +69,6 @@ ConversationArena::~ConversationArena() {
         if (file->fd >= 0) close(file->fd);
 #endif
     }
-}
-
-ConversationArena* ConversationArena::current() { return g_current; }
-
-ConversationArena* ConversationArena::set_current(ConversationArena* arena) {
-    ConversationArena* previous = g_current;
-    g_current = arena;
-    return previous;
 }
 
 bool ConversationArena::add_volume(const std::string& path, size_t file_bytes, std::string& err) {
@@ -207,7 +198,7 @@ std::unique_ptr<ConversationArena> ConversationArena::open(const std::vector<std
     return arena;
 }
 
-void* ConversationArena::allocate(size_t bytes) {
+void* ConversationArena::allocate(size_t bytes, ArenaExtent& out) {
     if (bytes == 0) return nullptr;
     const size_t want = round_up(bytes, kPage);
     std::lock_guard<std::recursive_mutex> lock(mu_);
@@ -226,6 +217,7 @@ void* ConversationArena::allocate(size_t bytes) {
             } else {
                 list.erase(list.begin() + (std::ptrdiff_t) i);
             }
+            out = got;
             void* p = static_cast<uint8_t*>(files_[v]->base) + got.offset;
             live_.push_back(got);
             live_ptrs_.push_back(p);
@@ -285,4 +277,112 @@ ConversationArena::Stats ConversationArena::stats() const {
     return out;
 }
 
-}  // namespace strata::core
+
+uint8_t* ConversationArena::pointer(const ArenaExtent& extent) const {
+    std::lock_guard<std::recursive_mutex> lock(mu_);
+    if (extent.volume >= files_.size() || files_[extent.volume]->base == nullptr) return nullptr;
+    return static_cast<uint8_t*>(files_[extent.volume]->base) + extent.offset;
+}
+
+namespace {
+
+using FiveBuffers = std::array<ConversationBuffer*, 5>;
+
+FiveBuffers five(ConversationKv& kv) { return {&kv.k, &kv.v, &kv.k_scale, &kv.v_scale, &kv.pooled}; }
+
+// One payload is copied between its buffer and its extents; the buffer spans at most 16 MiB segments, so an extent
+// never straddles two of them.
+constexpr size_t kChunk = 16 * 1024 * 1024;
+
+void release_parts(ConversationKv& kv, ConversationArena& arena) {
+    for (auto& part : kv.arena)
+        for (const auto& extent : part.extents) arena.release(arena.pointer(extent));
+    for (auto& part : kv.arena) { part.extents.clear(); part.size = 0; }
+    kv.arena_bytes = 0;
+}
+
+}  // namespace
+
+bool conversation_image_to_arena(SavedConversation& image, ConversationArena& arena, std::string& error) {
+    for (auto& kv : image.kv)
+        if (!conversation_kv_to_arena(kv, arena, error)) return false;
+    for (auto& stage : image.stage_images)
+        if (!conversation_image_to_arena(stage, arena, error)) return false;
+    return true;
+}
+
+bool conversation_image_from_arena(SavedConversation& image, ConversationArena& arena, std::string& error) {
+    for (auto& kv : image.kv)
+        if (!conversation_kv_from_arena(kv, arena, error)) return false;
+    for (auto& stage : image.stage_images)
+        if (!conversation_image_from_arena(stage, arena, error)) return false;
+    return true;
+}
+
+void conversation_image_release_arena(SavedConversation& image, ConversationArena& arena) {
+    for (auto& kv : image.kv) release_parts(kv, arena);
+    for (auto& stage : image.stage_images) conversation_image_release_arena(stage, arena);
+}
+
+bool conversation_kv_to_arena(ConversationKv& kv, ConversationArena& arena, std::string& error) {
+    if (kv.arena_bytes != 0) return true;   // already there
+    FiveBuffers buffers = five(kv);
+    // All the extents first: a full arena leaves the heap image untouched (the park is then simply refused).
+    std::array<ConversationKv::ArenaPart, 5> parts;
+    for (size_t i = 0; i < 5; ++i) {
+        const size_t n = buffers[i]->size();
+        parts[i].size = n;
+        for (size_t done = 0; done < n; done += kChunk) {
+            ArenaExtent extent;
+            if (arena.allocate(std::min(kChunk, n - done), extent) == nullptr) {
+                for (auto& part : parts)
+                    for (const auto& e : part.extents) arena.release(arena.pointer(e));
+                error = "the arena is full";
+                return false;
+            }
+            parts[i].extents.push_back(extent);
+        }
+    }
+    // Then copy each payload in and drop the heap copy.
+    for (size_t i = 0; i < 5; ++i) {
+        size_t done = 0;
+        for (const auto& extent : parts[i].extents) {
+            const size_t n = std::min((size_t) extent.length, parts[i].size - done);   // the last extent rounds up to a page
+            if (!buffers[i]->read(arena.pointer(extent), done, n)) {
+                release_parts(kv, arena);
+                error = "the snapshot buffer is shorter than its layout";
+                return false;
+            }
+            done += n;
+        }
+        *buffers[i] = ConversationBuffer();
+    }
+    kv.arena = std::move(parts);
+    kv.arena_bytes = 0;
+    for (const auto& part : kv.arena) kv.arena_bytes += part.size;
+    return true;
+}
+
+bool conversation_kv_from_arena(ConversationKv& kv, ConversationArena& arena, std::string& error) {
+    if (kv.arena_bytes == 0) return true;
+    FiveBuffers buffers = five(kv);
+    for (size_t i = 0; i < 5; ++i) {
+        const size_t total = kv.arena[i].size;
+        if (total == 0) { buffers[i]->resize(0); continue; }
+        buffers[i]->resize(total, 0);
+        size_t done = 0;
+        for (const auto& extent : kv.arena[i].extents) {
+            const uint8_t* src = arena.pointer(extent);
+            const size_t n = std::min((size_t) extent.length, total - done);
+            buffers[i]->visit(done, n, [&](uint8_t* p, size_t len, size_t at) {
+                std::memcpy(p, src + (at - done), len);
+                return true;
+            });
+            done += n;
+        }
+    }
+    release_parts(kv, arena);
+    return true;
+}
+
+void conversation_kv_release_arena(ConversationKv& kv, ConversationArena& arena) { release_parts(kv, arena); }}  // namespace strata::core

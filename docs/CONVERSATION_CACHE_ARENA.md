@@ -1,5 +1,18 @@
 # The conversation cache on disk: a mapped arena on the page-file volumes
 
+## Status
+
+M1 and M2 are implemented on the `cache-arena` branch: the arena, the copy in and out, the cache hooks and the
+tests.  Measured on this PC through the real server (9k-token conversation, 375 MB): park 93 ms on the heap and
+223 ms with the arena, restore 46 ms, and the second request for the parked conversation was served in 0.4 s with
+9054 cached prompt tokens.  M3 (entry descriptors, so a restarted engine adopts parked conversations instead of
+reclaiming the space) is not implemented: a restart wipes the table.
+
+One warning for anyone changing `ConversationBuffer` or `ConversationKv`: do a **clean** rebuild.  An incremental
+build that keeps one stale object file compiled against the old layout crashes the park path with 0xC0000005
+(both a changed segment type and an added field did it, and a clean rebuild fixed both).
+
+
 Status: **design only**, nothing of it is implemented. The measurements below were taken on this PC (Windows 11,
 RTX 5080, 62.6 GiB RAM, five Intel Optane M10 16 GB modules mounted at `C:\OptanePagefiles\{1..5}`, 12.4 GB
 usable each), with the page files shrunk to 4 GiB each so 9.4 GB per volume was free. The tool was a ctypes
@@ -84,18 +97,20 @@ C:\OptanePagefiles\5\strata-arena.bin  8.0 GB
 
 ## Allocation, park, restore, evict
 
-- **Allocator**: fixed 16 MiB extents, one free list per volume, first fit; `alloc(bytes)` returns a list of
-  `{volume, offset, length}`. A conversation's `SavedConversation` is (live checkpoint + checkpoints + one
-  `ConversationKv` per layer and the draft layer + `stage_images` for a layer split), each part holding five
-  `ConversationBuffer`s, so the extent table is tens of entries, not thousands.
-- **Park**: the existing copy is unchanged in size, only the destination changes -
-  `ConversationBuffer::resize` allocates segments from the arena and the copy faults the pages in, dirtying 16 MiB
-  ranges spread over the five volumes. The lazy writer drains them at up to 806 MB/s in the background (3.5 GB in
-  about 4.5 s), so the request sees the same park cost as today.
-- **Restore**: `visit()` reads the mapping; 16 MiB extents with NTFS read-ahead across five volumes reach about
-  2 GB/s, so 3.5 GB is about 1.7 s - inside the 18-19 s the engine already spends rebuilding the pools.
-- **Evict**: the LRU entry returns its extents to the free lists and the extent table is rewritten (a few KiB,
-  sequential). Freed pages become clean and the OS drops them; nothing is charged to commit.
+- **Allocator**: page-aligned extents, one free list per volume, first fit, the volume rotating with each
+  allocation.  A payload is copied in 16 MiB chunks (the segment size of `ConversationBuffer`), one extent per
+  chunk, so a conversation's K/V is tens of extents spread over all five volumes.
+- **Park**: the existing snapshot path is untouched - it builds the image on the heap exactly as before.  `put()`
+  then copies each K/V payload into its extents and frees the heap buffer, so the parked bytes become file-backed
+  pages.  Measured on this PC with a 9k-token conversation (375 MB): 93 ms to build the image, 223 ms with the
+  copy into the arena (+130 ms, memcpy speed); at 3.5 GB that is about +1.2 s, and the write-back of the dirty
+  pages runs in the background at up to 806 MB/s.
+- **Restore**: `take()` copies the payloads back into heap buffers (about 0.4 s for 3.5 GB) before the existing
+  restore path runs, so validation, restore and borrow never see anything unusual.
+- **Evict**: the LRU entry returns its extents to the free lists without a copy, and the extent table is rewritten
+  (a few KiB).  Freed pages become clean and the OS drops them; nothing is charged to commit.
+- **Borrow** (the `pin=N` sibling path) is disabled while the arena keeps the payloads: a parked image then holds
+  no RAM bytes to borrow from, so the caller takes it whole instead (one extra copy, still correct).
 
 ## Identity and adoption after a restart
 
@@ -134,13 +149,11 @@ for 11-15 conversations of 2.5-3.5 GB.
 
 | file | change |
 | --- | --- |
-| `include/strata/core/conversation_buffer.hpp` | a segment that can point into a mapping (`{uint8_t* p, size_t cap}`) instead of owning memory; `bytes()` and `allocation_peak()` account through the arena |
-| `include/strata/core/conversation_arena.hpp`, `src/core/conversation_arena.cpp` (new) | the five mappings, the extent allocator, the header/table, identity, adoption, statistics |
-| `include/strata/core/conversation_cache.hpp` | park/evict hooks: an entry's extents are taken at park and returned at evict |
-| `src/program/generate.cpp` | `--conversation-cache-dir DIR` (arena on, default off) and `--conversation-cache-arena-gib N`; the park path hands the buffers the arena |
-| `serve/server.py` | pass the two settings through; `/status` reports adopted entries, arena bytes free and evictions; one line at start |
-| `CMakeLists.txt` | the new source file |
-| tests | `conversation_arena_test.cpp` (alloc/free/stripe/identity/adopt/corruption) plus the existing `conversation_cache_test` |
+| `include/strata/core/conversation_arena.hpp`, `src/core/conversation_arena.cpp` (new) | the mappings, the extent allocator, the header/identity, and `conversation_kv_to_arena` / `conversation_kv_from_arena` / `conversation_kv_release_arena` (copy in, copy out, release) |
+| `include/strata/core/conversation_cache.hpp` | `ConversationKv::arena` (extents and payload sizes), `bytes()` counting them, and the cache's `set_arena` / `put` / `take` / `erase` / `clear` hooks |
+| `src/program/generate.cpp` | `--conversation-cache-dir FILES` (comma separated, one path per volume) and `--conversation-cache-arena-gib N` (default 8); `conversations.set_arena(...)`; one line at start |
+| `CMakeLists.txt` | the new source file and test |
+| tests | `conversation_arena_test.cpp` (extents, exhaustion, identity, K/V round trip, cache round trip, the heap default) plus the existing conversation tests |
 
 The flag is off by default: without `--conversation-cache-dir` nothing changes, which is what the project's
 rules ask of a new feature.
@@ -149,8 +162,8 @@ rules ask of a new feature.
 
 1. **M1 (1 day)** - `ConversationArena` alone: mappings, extents, header, identity, unit tests against five
    directories.
-2. **M2 (1.5 days)** - `ConversationBuffer` allocation through the arena; park/restore behind the flag; the
-   342k/92k churn for 20 minutes with no regression; `/status` shows the arena.
+2. **M2 (1.5 days)** - the copy in at `put()` and the copy out at `take()` behind the flag; the 342k/92k churn
+   for 20 minutes with no regression.
 3. **M3 (1 day)** - adoption, wipe on identity change, eviction, statistics; kill the engine and restart it, the
    log says how many entries were adopted.
 4. **M4 (1 day)** - the full test suite plus a measured comparison (park/restore time, throughput, commit with
