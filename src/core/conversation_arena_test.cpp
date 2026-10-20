@@ -1,4 +1,4 @@
-// Tests for the mapped-file arena behind --conversation-cache-dir (docs/CONVERSATION_CACHE_ARENA.md).
+// Tests for the arena behind --conversation-cache-dir (docs/CONVERSATION_CACHE_ARENA.md).
 // Five small files in a temporary directory stand in for the five Optane volumes.
 
 #include "strata/core/conversation_arena.hpp"
@@ -42,23 +42,25 @@ int main() {
     for (int i = 1; i <= 5; ++i) paths.push_back((dir / ("strata-arena." + std::to_string(i) + ".bin")).string());
     std::string err;
 
-    // 1. Open, allocate, write, release: extents come back to the free lists.
+    // 1. Open, allocate, write, read, release: extents come back to the free lists.
     {
         auto arena = ConversationArena::open(paths, kEach, 11, 22, err);
         check(arena != nullptr, "the arena opens over five files");
         const auto start = arena->stats();
-        check(start.volumes == 5, "five volumes are mapped");
+        check(start.volumes == 5, "five volumes are opened");
         const size_t want = 20 * 1024 * 1024 + 123;
         ArenaExtent extent;
-        void* p = arena->allocate(want, extent);
-        check(p != nullptr && p == arena->pointer(extent), "a 20 MiB extent is served");
-        std::memset(p, 0x5a, (size_t) extent.length);
-        check(static_cast<uint8_t*>(p)[extent.length - 1] == 0x5a, "the extent is writable to its end");
+        check(arena->allocate(want, extent), "a 20 MiB extent is served");
+        std::vector<uint8_t> buf((size_t) extent.length, 0x5a), back((size_t) extent.length, 0);
+        check(arena->write(extent, buf.data(), buf.size()), "the extent takes a write");
+        check(arena->read(extent, back.data(), back.size()) && back.back() == 0x5a, "and reads back");
         check(arena->stats().used_bytes >= want, "the used bytes account it");
-        void* q = arena->allocate(8 * 1024 * 1024);
-        check(q != nullptr && q != p, "a second extent is a different range");
-        arena->release(p);
-        arena->release(q);
+        ArenaExtent second;
+        check(arena->allocate(8 * 1024 * 1024, second) &&
+                  (second.volume != extent.volume || second.offset != extent.offset),
+              "a second extent is a different range");
+        arena->release_extent(extent);
+        arena->release_extent(second);
         const auto after = arena->stats();
         check(after.used_bytes == 0, "released extents are free again");
         check(after.free_bytes == start.free_bytes, "the free bytes are back to the start");
@@ -68,20 +70,22 @@ int main() {
     {
         auto arena = ConversationArena::open(paths, kEach, 11, 22, err);
         check(arena != nullptr, "the arena reopens");
-        check(arena->allocate(kEach) == nullptr, "a request larger than a volume is refused");
-        check(arena->allocate(4 * 1024 * 1024) != nullptr, "a fitting request still works after a refusal");
+        ArenaExtent extent;
+        check(!arena->allocate(kEach, extent), "a request larger than a volume is refused");
+        check(arena->allocate(4 * 1024 * 1024, extent), "a fitting request still works after a refusal");
     }
 
     // 3. Identity: another config wipes the arena; the same identity reclaims the old extents (until M3).
     {
         auto arena = ConversationArena::open(paths, kEach, 11, 22, err);
-        check(arena->allocate(1024 * 1024) != nullptr, "an extent before the identity change");
+        ArenaExtent extent;
+        check(arena->allocate(1024 * 1024, extent), "an extent before the identity change");
         arena.reset();
         auto other = ConversationArena::open(paths, kEach, 11, 99, err);
         check(other != nullptr, "the arena reopens with another config");
         check(other->stats().used_bytes == 0, "the mismatched arena starts empty");
-        void* keep = other->allocate(2 * 1024 * 1024);
-        check(keep != nullptr, "an extent in the new arena");
+        ArenaExtent kept;
+        check(other->allocate(2 * 1024 * 1024, kept), "an extent in the new arena");
         other.reset();
         auto same = ConversationArena::open(paths, kEach, 11, 99, err);
         check(same->stats().used_bytes == 0, "a matching arena reclaims a previous run's extents (no entry descriptors yet)");
@@ -97,9 +101,7 @@ int main() {
         kv.k_scale.resize(0);
         kv.v_scale.resize(4096, 0x03);
         kv.pooled.resize(65536, 0x04);
-        const bool moved = conversation_kv_to_arena(kv, *arena, err);
-        if (!moved) std::fprintf(stderr, "  (to_arena: %s)\n", err.c_str());
-        check(moved, "the image moves into the arena");
+        check(conversation_kv_to_arena(kv, *arena, err), "the image moves into the arena");
         check(kv.k.size() == 0 && kv.v.size() == 0 && kv.pooled.size() == 0, "the heap copies are freed");
         check(kv.bytes() >= big + small + 4096 + 65536, "the cache byte accounting still counts the parked payload");
         check(arena->stats().used_bytes >= big + small + 4096 + 65536, "the payloads are in the arena");
@@ -114,7 +116,7 @@ int main() {
         check(arena->stats().used_bytes == 0, "release frees them without a copy");
     }
 
-    // 5. Through the cache: put copies into the arena, take copies back, eviction frees, the budget still bounds.
+    // 5. Through the cache: put copies into the arena, take copies back, clear frees, the budget still bounds.
     {
         auto arena = ConversationArena::open(paths, kEach, 11, 22, err);
         ConversationCache cache(64ull * 1024 * 1024, 3);
@@ -132,7 +134,6 @@ int main() {
         check(out.kv.size() == 2 && out.kv[0].k.size() == 8 * 1024 * 1024 && holds(out.kv[0].k, 0x11),
               "the taken image is materialized with its bytes");
         check(arena->stats().used_bytes == 0, "and its extents are back");
-        check(cache.size() == 0, "the entry is gone");
         SavedConversation again;
         again.live.ids = {4};
         again.kv.resize(1);

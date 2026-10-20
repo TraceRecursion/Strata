@@ -79,7 +79,8 @@ struct ConversationKv {
 /// Moves a parked image's K/V payloads into the arena (the heap copies are freed) and back.  A full arena leaves
 /// the image untouched and fails, which the cache turns into a skipped park.  release frees the extents without
 /// copying anything back (eviction).
-bool conversation_kv_to_arena(ConversationKv& kv, ConversationArena& arena, std::string& error);
+bool conversation_kv_to_arena(ConversationKv& kv, ConversationArena& arena, std::string& error,
+                               bool throttle = false);
 bool conversation_kv_from_arena(ConversationKv& kv, ConversationArena& arena, std::string& error);
 void conversation_kv_release_arena(ConversationKv& kv, ConversationArena& arena);
 
@@ -219,7 +220,8 @@ int64_t conversation_prefix(const ConversationCheckpoint& c, const std::vector<T
 }
 
 /// The whole image - its K/V and, recursively, a layer split's stage images - moved into and out of the arena.
-bool conversation_image_to_arena(SavedConversation& image, ConversationArena& arena, std::string& error);
+bool conversation_image_to_arena(SavedConversation& image, ConversationArena& arena, std::string& error,
+                                 bool throttle = false);
 bool conversation_image_from_arena(SavedConversation& image, ConversationArena& arena, std::string& error);
 void conversation_image_release_arena(SavedConversation& image, ConversationArena& arena);
 
@@ -464,9 +466,15 @@ public:
 
     bool put(SavedConversation&& image, size_t held = 0) {
         const size_t n = image.bytes();
-        if (!enabled() || held > budget_ || n > budget_ - held) return false;   // make_room's refusal, first
+        // A refusal destroys the image, so its arena extents go back first (the background writer's image is already
+        // in the files when it gets here).
+        auto refuse = [&] {
+            if (arena_ != nullptr) conversation_image_release_arena(image, *arena_);
+            return false;
+        };
+        if (!enabled() || held > budget_ || n > budget_ - held) return refuse();   // make_room's refusal, first
         drop_superseded(image.live.ids, image.live.imgs, image.checkpoints, image.cvec);
-        if (!make_room(n, held)) return false;
+        if (!make_room(n, held)) return refuse();
         // The payloads move into the arena before they are stored, so the parked bytes are file-backed pages: the
         // heap copies are freed here and the restore side copies them back.  A full arena refuses the park.
         if (arena_ != nullptr) {

@@ -2298,6 +2298,89 @@ static void prime_hw_queues() {
 }
 #endif
 
+/// --conversation-cache-dir: the park's arena copy runs on one writer thread, so the request after a park does not
+/// wait for the device (measured: 26.8 s for a 257k-token conversation, and it used to land on the next request).
+/// The main thread owns the slot and the cache - put() only ever runs there; the writer only touches the image it
+/// was handed and the extents inside it, and publishes completion through one atomic.
+class ParkWriter {
+public:
+    explicit ParkWriter(strata::core::ConversationArena* arena) : arena_(arena) {
+        if (arena_ != nullptr) thread_ = std::thread([this] { run(); });
+    }
+    ~ParkWriter() { stop(); }
+    ParkWriter(const ParkWriter&) = delete;
+    ParkWriter& operator=(const ParkWriter&) = delete;
+    bool busy() {
+        std::lock_guard<std::mutex> lock(mu_);
+        return job_ != nullptr;
+    }
+    bool submit(strata::core::SavedConversation&& image) {
+        if (arena_ == nullptr) return false;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            if (job_ != nullptr) return false;
+            job_ = std::make_unique<Job>();
+            job_->image = std::move(image);
+        }
+        strata::core::arena_quiet_until_ms().store(strata::core::progress_now_ms() + 3000, std::memory_order_relaxed);
+        cv_.notify_one();
+        return true;
+    }
+    /// Main thread, once per request: a finished job joins the cache (put() finds the payloads already in the files),
+    /// a failed one releases its extents.
+    template <class Put>
+    void drain(Put&& put) {
+        strata::core::arena_quiet_until_ms().store(strata::core::progress_now_ms() + 3000, std::memory_order_relaxed);
+        std::unique_ptr<Job> job;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            if (job_ == nullptr || !job_->done.load(std::memory_order_acquire)) return;
+            job = std::move(job_);
+        }
+        if (job->ok) put(std::move(job->image));
+        else strata::core::conversation_image_release_arena(job->image, *arena_);
+    }
+private:
+    struct Job {
+        strata::core::SavedConversation image;
+        std::atomic<bool> done{false};
+        bool ok = false;
+    };
+    void run() {
+        strata::aux_cpus::pin_current_thread();
+        for (;;) {
+            Job* job = nullptr;
+            {
+                std::unique_lock<std::mutex> lock(mu_);
+                cv_.wait(lock, [&] { return stop_ || job_ != nullptr; });
+                if (stop_ && job_ == nullptr) return;
+                job = job_.get();
+            }
+            std::string error;
+            job->ok = strata::core::conversation_image_to_arena(job->image, *arena_, error);
+            if (!job->ok)
+                std::fprintf(stderr, "strata serve: conversation arena: the background park failed (%s)\n",
+                             error.c_str());
+            job->done.store(true, std::memory_order_release);
+        }
+    }
+    void stop() {
+        if (!thread_.joinable()) return;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        thread_.join();
+    }
+    strata::core::ConversationArena* arena_ = nullptr;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::unique_ptr<Job> job_;
+    bool stop_ = false;
+    std::thread thread_;
+};
+
 int main(int argc, char** argv) {
     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
@@ -9300,6 +9383,9 @@ int main(int argc, char** argv) {
                 }
             }
         }
+        // --conversation-cache-dir: the park's arena copy runs on this writer.  Declared after the arena so it stops
+        // before the arena goes away (the writer holds the image, the arena holds the files).
+        ParkWriter park_writer(conversation_arena.get());
         // Save only on a switch/rewind, not on each continuing request. No graph
         // addresses change: all parked images live in ordinary host vectors.
         auto park_current_body = [&](size_t held) -> bool {
@@ -9386,7 +9472,6 @@ int main(int argc, char** argv) {
                 err.clear();
             }
             estimate += stage_estimate;
-            // A park carrying its own retained K/V replaces memory the cache
             // already held, so capacity is make_room's call - it runs next either
             // way, and put()'s accounting still bounds the budget. The with-reuse
             // estimate must stay uncapped: it counts the retained buffers'
@@ -9401,13 +9486,17 @@ int main(int argc, char** argv) {
             try {
                 const bool pageable = o.conversation_cache_admit == "commit";
                 const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
+                // --conversation-cache-dir: when the writer is free the arena copy runs there, so neither this request
+                // nor the next one waits for the device (measured: 26.8 s for a 257k-token conversation, which used to
+                // land on the next request).  A busy writer falls back to streaming the build into the arena.
+                const bool background = conversation_arena != nullptr && !park_writer.busy();
                 const size_t retained = reuse.bytes() + stage_retained;
                 size_t additional = estimate > retained ? estimate - retained : 0;
                 // --conversation-cache-dir: each layer's K/V goes straight into the arena files as it is built, so
                 // the gate only has to cover the checkpoint metadata.  Counting the whole estimate evicted parked
                 // conversations for bytes that never charge commit (measured: a 454k-token park evicted two, and
                 // the read after it fell to 12.9 tok/s).
-                if (conversation_arena) {
+                if (conversation_arena && !background) {
                     size_t meta = 0;
                     if (strata::core::conversation_snapshot_metadata_bytes(view, ss, g, draft0, meta, err))
                         additional = std::min(additional, meta);
@@ -9459,7 +9548,7 @@ int main(int argc, char** argv) {
                 strata::core::SavedConversation image;
                 size_t reused_bytes = 0;
                 if (!strata::core::conversation_snapshot_save(image, view, ss, g, draft0, err,
-                        std::move(reuse), &reused_bytes, conversation_arena.get())) return false;
+                        std::move(reuse), &reused_bytes, background ? nullptr : conversation_arena.get())) return false;
                 for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
                     auto& st = stages[k];
                     const strata::core::OnDevice on(st->dev);
@@ -9467,7 +9556,7 @@ int main(int argc, char** argv) {
                     const strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached};
                     strata::core::SavedConversation part;
                     if (!strata::core::conversation_snapshot_save(part, view_k, st->ss, g, draft_of(k), err,
-                            std::move(stage_reuse[k]), &reused_bytes, conversation_arena.get()))
+                            std::move(stage_reuse[k]), &reused_bytes, background ? nullptr : conversation_arena.get()))
                         return false;
                     image.stage_images.push_back(std::move(part));
                 }
@@ -9486,6 +9575,15 @@ int main(int argc, char** argv) {
                     return true;
                 }
                 const size_t snapshot_bytes = image.bytes();
+                // The image is complete; hand the arena copy to the writer and let this request (and the next one)
+                // continue.  The entry joins the cache at the next request's drain, so a conversation that is asked
+                // for again within seconds of a park is a miss there, never a stall.
+                if (background && park_writer.submit(std::move(image))) {
+                    std::fprintf(stderr, "strata serve: conversation cache: parked %zu tokens on the background writer "
+                                         "(%zu MiB, %zu parked now)\n",
+                                 live.size(), snapshot_bytes >> 20, conversations.size());
+                    return true;
+                }
                 const bool stored = conversations.put(std::move(image), held);
                 std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
                              stored ? "parked" : "skipped", live.size(),
@@ -12548,6 +12646,17 @@ int main(int argc, char** argv) {
                                  k + 1, (long long) (k < now.size() ? now[k].start : -1));
                 }
             }
+            // --conversation-cache-dir: a park that finished on the writer joins the cache here, on the request thread
+            // (put() only ever runs there); a failed one releases its extents.
+            park_writer.drain([&](strata::core::SavedConversation&& image) {
+                const size_t bytes = image.bytes();
+                if (conversations.put(std::move(image)))
+                    std::fprintf(stderr, "strata serve: conversation cache: the background park stored %zu MiB; parked=%zu bytes=%zu\n",
+                                 bytes >> 20, conversations.size(), conversations.bytes());
+                else
+                    std::fprintf(stderr, "strata serve: conversation cache: the background park was refused (%zu MiB)\n",
+                                 bytes >> 20);
+            });
             const auto parked = conversations.best(ids, req_imgs, want_cvec);
             std::optional<strata::core::SavedConversation> incoming;
             // A checkpoint inside ANOTHER parked conversation (a sibling subagent's system prompt and tools, say) is

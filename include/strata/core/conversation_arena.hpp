@@ -1,19 +1,21 @@
-// The conversation cache's disk tier: a fixed set of mapped files, one per volume, carved into page-aligned
-// extents that a parked conversation's K/V payloads are copied into.  See docs/CONVERSATION_CACHE_ARENA.md.
+// The conversation cache's disk tier: a fixed set of files, one per volume, carved into page-aligned extents that a
+// parked conversation's K/V payloads are written into.  See docs/CONVERSATION_CACHE_ARENA.md.
 //
 // Design notes:
-//  * A parked image keeps its segmented K/V buffers on the heap while it is built (that is the existing snapshot
-//    path, untouched).  Park then copies each payload into the arena and frees the heap copy, so the parked bytes
-//    become file-backed pages: they no longer charge commit - the pressure behind two engine hangs - and the OS
-//    may write them back and drop them without evicting the application.
-//  * Restoring copies the payloads back into heap buffers before the existing restore path runs, so nothing
-//    outside this file needs to know where they were.
-//  * The volume rotates with every extent, so a park spreads its write-back over all five devices (measured:
-//    806 MB/s write and 2.08 GB/s read with five volumes in parallel).
-//  * The arena is off unless the engine is given the file list (--conversation-cache-dir); without it the cache
-//    behaves exactly as before.
+//  * A parked image keeps its segmented K/V buffers on the heap while a layer is built (that is the existing
+//    snapshot path, untouched).  Each layer is then written into the arena and the heap copy freed, so the parked
+//    bytes live in files: they no longer charge commit, and the OS may keep the model's own pages in RAM.
+//  * The files are written and read with unbuffered I/O (FILE_FLAG_NO_BUFFERING, pread/pwrite elsewhere).  A
+//    memory-mapped arena was tried first: its freshly touched pages won the OS's LRU over the model's pages, and the
+//    request after a park read at 218 tok/s from the page files.  Unbuffered I/O keeps the parked bytes out of RAM.
+//  * Restoring reads the payloads back into heap buffers before the existing restore path runs, so nothing outside
+//    this file needs to know where they were.
+//  * The volume rotates with every extent, so a park spreads its writes over all five devices (measured: 806 MB/s
+//    for five in parallel, 250-430 MB/s while the page files on the same devices are busy).
+//  * The arena is off unless the engine is given the file list (--conversation-cache-dir).
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -22,6 +24,10 @@
 #include <vector>
 
 namespace strata::core {
+
+/// The background park writer waits until this steady-clock time before it writes: the engine pushes it forward on
+/// every request, so a park never competes with a request that arrives right after the previous one.
+std::atomic<int64_t>& arena_quiet_until_ms();
 
 struct ArenaExtent {
     uint32_t volume = 0;
@@ -38,37 +44,40 @@ public:
         size_t live_extents = 0;
     };
 
-    /// Opens (creating when needed) one file per path, maps it, and checks its header against `model_id` /
-    /// `config_id` - a mismatched arena is wiped, because a cache may be lost but must never be misread.
-    /// Returns nullptr and fills `err` when no volume can be mapped.
+    /// Opens (creating when needed) one file per path and checks its header against `model_id` / `config_id` - a
+    /// mismatched arena is wiped, because a cache may be lost but must never be misread.  Returns nullptr and fills
+    /// `err` when no volume can be opened.
     static std::unique_ptr<ConversationArena> open(const std::vector<std::string>& paths, size_t file_bytes,
                                                    uint64_t model_id, uint64_t config_id, std::string& err);
     ~ConversationArena();
     ConversationArena(const ConversationArena&) = delete;
     ConversationArena& operator=(const ConversationArena&) = delete;
 
-    /// A page-aligned contiguous extent on the next volume with room; nullptr when every volume is full
-    /// (the cache treats that as a failed park, not as an engine error).  `out` describes the extent.
-    void* allocate(size_t bytes, ArenaExtent& out);
-    void* allocate(size_t bytes) { ArenaExtent unused; return allocate(bytes, unused); }
-    /// The mapped address `extent` starts at (valid while the arena is open).
-    uint8_t* pointer(const ArenaExtent& extent) const;
-    /// Writes `extent` back to its volume now.  A park flushes each 16 MiB extent, so the dirty-page backlog
-    /// stays bounded instead of flooding RAM and evicting the engine's own working set.
-    void flush(const ArenaExtent& extent);
-    /// Returns an extent obtained from allocate(); a pointer the arena does not know is ignored.
-    void release(void* p);
+    /// A page-aligned contiguous extent on the next volume with room; false when every volume is full (the cache
+    /// treats that as a failed park, not as an engine error).
+    bool allocate(size_t bytes, ArenaExtent& out);
+    /// Frees an extent obtained from allocate().
+    void release_extent(const ArenaExtent& extent);
+    /// Writes `bytes` of `data` into `extent` and reads it back, unbuffered.
+    bool write(const ArenaExtent& extent, const uint8_t* data, size_t bytes);
+    bool read(const ArenaExtent& extent, uint8_t* data, size_t bytes);
     Stats stats() const;
 
 private:
     ConversationArena();
     struct File;
+    struct FileState {
+        bool fail = false;
+    };
     bool add_volume(const std::string& path, size_t file_bytes, std::string& err);
+    bool read_raw(size_t volume, uint64_t offset, size_t bytes);
+    bool write_raw(size_t volume, uint64_t offset, size_t bytes);
     void persist_table();
     std::vector<std::unique_ptr<File>> files_;
+    std::vector<FileState> file_state_;
     std::vector<std::vector<ArenaExtent>> free_;      // per volume, sorted by offset
     std::vector<ArenaExtent> live_;                    // the extent table, persisted in volume 0's header
-    std::vector<void*> live_ptrs_;                     // parallel to live_
+    void* bounce_ = nullptr;                           // one 16 MiB aligned chunk for the unbuffered I/O
     uint64_t model_id_ = 0, config_id_ = 0;
     size_t file_bytes_ = 0, cursor_ = 0;
     mutable std::recursive_mutex mu_;
