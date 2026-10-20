@@ -70,9 +70,9 @@ struct ConversationKv {
         size_t size = 0;
     };
     std::array<ArenaPart, 5> arena{};
-    size_t arena_bytes = 0;
+    size_t arena_bytes = 0;   // the payloads, in the arena files: not RAM, so not part of bytes()
     size_t bytes() const {
-        return k.bytes() + v.bytes() + k_scale.bytes() + v_scale.bytes() + pooled.bytes() + arena_bytes;
+        return k.bytes() + v.bytes() + k_scale.bytes() + v_scale.bytes() + pooled.bytes();
     }
 };
 

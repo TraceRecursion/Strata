@@ -365,16 +365,13 @@ bool conversation_kv_to_arena(ConversationKv& kv, ConversationArena& arena, std:
                 return false;
             }
             done += n;
+            // The background writer pauses while a request is being served (the engine pushes the window forward
+            // at every request), so a restore or a prompt read never queues behind a park.
+            if (throttle)
+                while (progress_now_ms() < arena_quiet_until_ms().load(std::memory_order_relaxed))
+                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
             // The background writer yields to the engine: while a request is running it waits, so a restore or a
             // prompt read never queues behind a multi-GB park.
-            if (throttle) {
-                auto reading_prompt = [] {
-                    const char* where = strata::core::progress().where.load(std::memory_order_relaxed);
-                    return where != nullptr && std::strncmp(where, "reading the prompt", 18) == 0;
-                };
-                while (progress_now_ms() < arena_quiet_until_ms().load(std::memory_order_relaxed) || reading_prompt())
-                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-            }
         }
         *buffers[i] = ConversationBuffer();
     }

@@ -2300,7 +2300,8 @@ static void prime_hw_queues() {
 
 /// --conversation-cache-dir: the park's arena copy runs on one writer thread, so the request after a park does not
 /// wait for the device (measured: 26.8 s for a 257k-token conversation, and it used to land on the next request).
-/// The main thread owns the slot and the cache - put() only ever runs there; the writer only touches the image it
+/// The main thread owns the job and the cache - put() only ever runs there; the writer touches only the layer it
+/// was given and the extents inside it, and the job is handed over under one mutex.
 /// was handed and the extents inside it, and publishes completion through one atomic.
 class ParkWriter {
 public:
@@ -2314,27 +2315,39 @@ public:
         std::lock_guard<std::mutex> lock(mu_);
         return job_ != nullptr;
     }
-    bool submit(strata::core::SavedConversation&& image) {
-        if (arena_ == nullptr) return false;
+    /// The build writes into this image; the writer copies each layer as soon as layer() announces it, so the heap
+    /// holds one layer instead of the whole image.
+    strata::core::SavedConversation& begin() {
+        std::lock_guard<std::mutex> lock(mu_);
+        job_ = std::make_unique<Job>();
+        strata::core::arena_quiet_until_ms().store(strata::core::progress_now_ms() + 3000, std::memory_order_relaxed);
+        return job_->image;
+    }
+    /// Build thread, after layer `index` of the image was built.
+    void layer(size_t index) {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (job_ == nullptr) return;
+        job_->available = index + 1;
+        cv_.notify_all();
+    }
+    /// Build thread, once the image is complete (ok false: drop it).
+    void finish(bool ok) {
         {
             std::lock_guard<std::mutex> lock(mu_);
-            if (job_ != nullptr) return false;
-            job_ = std::make_unique<Job>();
-            job_->image = std::move(image);
+            if (job_ == nullptr) return;
+            job_->build_done = true;
+            job_->ok = job_->ok && ok;
         }
-        strata::core::arena_quiet_until_ms().store(strata::core::progress_now_ms() + 3000, std::memory_order_relaxed);
-        cv_.notify_one();
-        return true;
+        cv_.notify_all();
     }
-    /// Main thread, once per request: a finished job joins the cache (put() finds the payloads already in the files),
-    /// a failed one releases its extents.
+    /// Main thread, once per request: a finished job joins the cache at the drain, a failed one releases its extents.
     template <class Put>
     void drain(Put&& put) {
-        strata::core::arena_quiet_until_ms().store(strata::core::progress_now_ms() + 3000, std::memory_order_relaxed);
+        strata::core::arena_quiet_until_ms().store(strata::core::progress_now_ms() + 30000, std::memory_order_relaxed);
         std::unique_ptr<Job> job;
         {
             std::lock_guard<std::mutex> lock(mu_);
-            if (job_ == nullptr || !job_->done.load(std::memory_order_acquire)) return;
+            if (job_ == nullptr || !job_->build_done || job_->copied < job_->available) return;
             job = std::move(job_);
         }
         if (job->ok) put(std::move(job->image));
@@ -2343,25 +2356,34 @@ public:
 private:
     struct Job {
         strata::core::SavedConversation image;
-        std::atomic<bool> done{false};
-        bool ok = false;
+        size_t available = 0;   // layers built (the build thread sets it under the mutex)
+        size_t copied = 0;      // layers written to the arena (the writer sets it under the mutex)
+        bool build_done = false;
+        bool ok = true;
     };
     void run() {
         strata::aux_cpus::pin_current_thread();
         for (;;) {
-            Job* job = nullptr;
+            size_t index = 0;
+            strata::core::SavedConversation* image = nullptr;
             {
                 std::unique_lock<std::mutex> lock(mu_);
-                cv_.wait(lock, [&] { return stop_ || job_ != nullptr; });
-                if (stop_ && job_ == nullptr) return;
-                job = job_.get();
+                cv_.wait(lock, [&] { return stop_ || (job_ != nullptr && job_->copied < job_->available); });
+                if (stop_ || job_ == nullptr) return;
+                index = job_->copied;
+                image = &job_->image;
             }
             std::string error;
-            job->ok = strata::core::conversation_image_to_arena(job->image, *arena_, error);
-            if (!job->ok)
-                std::fprintf(stderr, "strata serve: conversation arena: the background park failed (%s)\n",
-                             error.c_str());
-            job->done.store(true, std::memory_order_release);
+            const bool ok = strata::core::conversation_kv_to_arena(image->kv[index], *arena_, error, true);
+            if (!ok)
+                std::fprintf(stderr, "strata serve: conversation arena: the background park failed on layer %zu (%s)\n",
+                             index, error.c_str());
+            {
+                std::lock_guard<std::mutex> lock(mu_);
+                job_->ok = job_->ok && ok;
+                ++job_->copied;
+            }
+            cv_.notify_all();
         }
     }
     void stop() {
@@ -2380,6 +2402,11 @@ private:
     bool stop_ = false;
     std::thread thread_;
 };
+
+/// The sink the build calls after each K/V layer (the writer copies it while the build goes on).
+inline void park_layer_sink(void* context, strata::core::SavedConversation&, size_t index) {
+    static_cast<ParkWriter*>(context)->layer(index);
+}
 
 int main(int argc, char** argv) {
     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
@@ -9477,9 +9504,18 @@ int main(int argc, char** argv) {
             // estimate must stay uncapped: it counts the retained buffers'
             // capacity and directories, and put() charges that same true size -
             // a capped figure would under-evict and overfill the budget.
-            if (!conversations.make_room(estimate, held)) {
-                std::fprintf(stderr, "strata serve: conversation cache: skip parking (snapshot %zu MiB exceeds available budget)\n",
-                             estimate >> 20);
+            // --conversation-cache-dir: the payloads go to the arena files, so the RAM checks (the cache budget and
+            // the admission gate below) only have to cover the checkpoint metadata; the arena size bounds the payloads.
+            size_t ram_estimate = estimate;
+            if (conversation_arena != nullptr) {
+                size_t meta = 0;
+                if (strata::core::conversation_snapshot_metadata_bytes(view, ss, g, draft0, meta, err))
+                    ram_estimate = meta + stage_estimate / 16;   // the stages: a rough share, they hold their own payloads
+                err.clear();
+            }
+            if (!conversations.make_room(ram_estimate, held)) {
+                std::fprintf(stderr, "strata serve: conversation cache: skip parking (snapshot %zu MiB of RAM exceeds available budget)\n",
+                             ram_estimate >> 20);
                 return true;
             }
             const auto t0 = Clock::now();
@@ -9489,19 +9525,9 @@ int main(int argc, char** argv) {
                 // --conversation-cache-dir: when the writer is free the arena copy runs there, so neither this request
                 // nor the next one waits for the device (measured: 26.8 s for a 257k-token conversation, which used to
                 // land on the next request).  A busy writer falls back to streaming the build into the arena.
-                const bool background = conversation_arena != nullptr && !park_writer.busy();
+                const bool background = conversation_arena != nullptr && !park_writer.busy() && n_st == 0;
                 const size_t retained = reuse.bytes() + stage_retained;
-                size_t additional = estimate > retained ? estimate - retained : 0;
-                // --conversation-cache-dir: each layer's K/V goes straight into the arena files as it is built, so
-                // the gate only has to cover the checkpoint metadata.  Counting the whole estimate evicted parked
-                // conversations for bytes that never charge commit (measured: a 454k-token park evicted two, and
-                // the read after it fell to 12.9 tok/s).
-                if (conversation_arena && !background) {
-                    size_t meta = 0;
-                    if (strata::core::conversation_snapshot_metadata_bytes(view, ss, g, draft0, meta, err))
-                        additional = std::min(additional, meta);
-                    err.clear();
-                }
+                size_t additional = ram_estimate > retained ? ram_estimate - retained : 0;
                 // The admission gate: the incoming snapshot has to fit beside the floor.  make_room() above
                 // only balanced the cache's own budget, so a full cache leaves this one short even though
                 // every parked conversation could give its memory back - and refusing here throws away the
@@ -9545,10 +9571,15 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: conversation cache: evicted %zu parked conversation%s to admit this snapshot (%s admission, %zu MiB plus %lld MiB floor)\n",
                                  evicted, evicted == 1 ? "" : "s", pageable ? "commit" : "physical RAM",
                                  additional >> 20, (long long) o.conversation_cache_min_free_mib);
-                strata::core::SavedConversation image;
+                strata::core::SavedConversation local_image;
+                strata::core::SavedConversation& image = background ? park_writer.begin() : local_image;
                 size_t reused_bytes = 0;
                 if (!strata::core::conversation_snapshot_save(image, view, ss, g, draft0, err,
-                        std::move(reuse), &reused_bytes, background ? nullptr : conversation_arena.get())) return false;
+                        std::move(reuse), &reused_bytes, background ? nullptr : conversation_arena.get(),
+                        background ? &park_layer_sink : nullptr, background ? &park_writer : nullptr)) {
+                    if (background) park_writer.finish(false);
+                    return false;
+                }
                 for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
                     auto& st = stages[k];
                     const strata::core::OnDevice on(st->dev);
@@ -9578,9 +9609,10 @@ int main(int argc, char** argv) {
                 // The image is complete; hand the arena copy to the writer and let this request (and the next one)
                 // continue.  The entry joins the cache at the next request's drain, so a conversation that is asked
                 // for again within seconds of a park is a miss there, never a stall.
-                if (background && park_writer.submit(std::move(image))) {
-                    std::fprintf(stderr, "strata serve: conversation cache: parked %zu tokens on the background writer "
-                                         "(%zu MiB, %zu parked now)\n",
+                if (background) {
+                    park_writer.finish(true);
+                    std::fprintf(stderr, "strata serve: conversation cache: parked %zu tokens: the arena copy streams on "
+                                         "the background writer (%zu MiB, %zu parked now)\n",
                                  live.size(), snapshot_bytes >> 20, conversations.size());
                     return true;
                 }

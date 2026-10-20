@@ -323,11 +323,14 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
 bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view,
                                 const SessionState& ss, const ModelGeometry& g,
                                 const QsaState* draft, std::string& error,
-                                ConversationKvReuse reuse, size_t* reused_bytes, ConversationArena* arena) {
+                                ConversationKvReuse reuse, size_t* reused_bytes, ConversationArena* arena,
+                                ConversationLayerSink sink, void* sink_context) {
     size_t estimate = 0;
     if (!conversation_snapshot_capture_bytes(reuse, view, ss, g, draft, estimate, error) || !sync(error)) return false;
-    // Build into a new object so a failure cannot publish a partial snapshot.
-    SavedConversation captured;
+    // Build into a new object so a failure cannot publish a partial snapshot - unless a layer sink is given: the
+    // caller owns the image (the arena writer fills it as the layers arrive), so the build writes it in place.
+    SavedConversation local;
+    SavedConversation& captured = sink != nullptr ? image : local;
     captured.geometry = geometry_key(g);
     captured.layer_lo = ss.layer_lo; captured.layer_hi = ss.layer_hi;
     captured.live.ids = view.ids; captured.live.imgs = view.images;
@@ -344,6 +347,7 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
             for (auto& kv : captured.kv) conversation_kv_release_arena(kv, *arena);
     };
     auto move_into_arena = [&](size_t index) {
+        if (sink != nullptr) { sink(sink_context, captured, index); return true; }   // the background writer copies it
         if (arena == nullptr) return true;
         if (!conversation_kv_to_arena(captured.kv[index], *arena, error)) { release_moved(); return false; }
         return true;
@@ -362,7 +366,7 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
                                   std::max<int64_t>(0, unchanged - 1), reused_bytes)) { release_moved(); return false; }
         if (!move_into_arena(captured.kv.size() - 1)) return false;
     }
-    image = std::move(captured);
+    if (sink == nullptr) image = std::move(local);
     return true;
 }
 
@@ -461,7 +465,8 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
 }
 bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view, const SessionState& ss,
                                 const ModelGeometry& g, const QsaState& draft, std::string& error,
-                                ConversationKvReuse reuse, size_t* reused_bytes, ConversationArena* arena) {
+                                ConversationKvReuse reuse, size_t* reused_bytes, ConversationArena* arena,
+                                ConversationLayerSink sink, void* sink_context) {
     return conversation_snapshot_save(image, view, ss, g, &draft, error, std::move(reuse), reused_bytes, arena);
 }
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& ss, const ModelGeometry& g,

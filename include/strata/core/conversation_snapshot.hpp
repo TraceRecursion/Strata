@@ -9,6 +9,12 @@
 
 namespace strata::core {
 
+/// Called after each K/V layer of the image was built (draft layer included), with the image it belongs to.  The
+/// conversation arena's background writer copies that layer into its files while the build goes on with the next
+/// one, so the heap never holds the whole image (measured: 4.5 GB for a 257k-token conversation, which crowded
+/// the model's pages out of RAM).
+using ConversationLayerSink = void (*)(void* context, SavedConversation& image, size_t index);
+
 // Caller synchronizes the device before saving, and after restoring all layers.
 // include_index is false for the draft layer (its attention has no indexer).
 size_t conversation_kv_bytes(const QsaState& state, const ModelGeometry& g, int64_t upto, bool include_index);
@@ -98,7 +104,8 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
                                 const SessionState& session, const ModelGeometry& g,
                                 const QsaState& draft, std::string& error,
                                 ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr,
-                                ConversationArena* arena = nullptr);
+                                ConversationArena* arena = nullptr, ConversationLayerSink sink = nullptr,
+                                void* sink_context = nullptr);
 // Disk save without capturing the K/V on the host: `meta` gets everything but the K/V (running state copied,
 // checkpoints as given by the view), `sources` one streamed source per QSA layer then the draft.  Caller has
 // synchronized and must not run the session until the file is written.
@@ -129,10 +136,15 @@ bool conversation_snapshot_bytes(const ConversationView& view, const SessionStat
 bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const ConversationView& view,
                                          const SessionState& session, const ModelGeometry& g, const QsaState* draft,
                                          size_t& bytes, std::string& error);
+/// Called after each K/V layer of the image was built (draft layer included), with the image it belongs to.  The
+/// conversation arena's background writer copies that layer into its files while the build goes on with the next
+/// one, so the heap never holds the whole image (measured: 4.5 GB for a 257k-token conversation, which crowded the
+/// model's pages out of RAM).
 bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view, const SessionState& session,
                                 const ModelGeometry& g, const QsaState* draft, std::string& error,
                                 ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr,
-                                ConversationArena* arena = nullptr);
+                                ConversationArena* arena = nullptr, ConversationLayerSink sink = nullptr,
+                                void* sink_context = nullptr);
 // The part of a snapshot that is not a K/V payload: the checkpoint metadata.  With the conversation arena
 // (--conversation-cache-dir) the payloads are file-backed as they are built, so this is all a park has to fit in
 // commit; the admission gate uses it instead of the whole estimate.
