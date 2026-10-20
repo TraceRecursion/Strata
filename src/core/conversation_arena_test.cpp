@@ -103,7 +103,8 @@ int main() {
         kv.pooled.resize(65536, 0x04);
         check(conversation_kv_to_arena(kv, *arena, err), "the image moves into the arena");
         check(kv.k.size() == 0 && kv.v.size() == 0 && kv.pooled.size() == 0, "the heap copies are freed");
-        check(kv.bytes() >= big + small + 4096 + 65536, "the cache byte accounting still counts the parked payload");
+        check(kv.bytes() == 0 && kv.arena_bytes >= big + small + 4096 + 65536,
+              "the RAM accounting is zero (the payloads are in the files) and arena_bytes counts them");
         check(arena->stats().used_bytes >= big + small + 4096 + 65536, "the payloads are in the arena");
         check(conversation_kv_from_arena(kv, *arena, err), "the image comes back");
         check(kv.k.size() == big && kv.v.size() == small && kv.v_scale.size() == 4096 && kv.pooled.size() == 65536,
@@ -143,7 +144,7 @@ int main() {
         check(arena->stats().used_bytes == 0, "and frees its extents");
     }
 
-    // 6. Without an arena the cache is the heap, exactly as before the feature.
+    // 5b. A small arena: a second park evicts the first instead of failing (the failure that reached a client once).
     {
         ConversationCache cache(64ull * 1024 * 1024, 2);
         check(!cache.arena_backed(), "no arena by default");

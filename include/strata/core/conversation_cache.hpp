@@ -475,8 +475,13 @@ public:
         if (!enabled() || held > budget_ || n > budget_ - held) return refuse();   // make_room's refusal, first
         drop_superseded(image.live.ids, image.live.imgs, image.checkpoints, image.cvec);
         if (!make_room(n, held)) return refuse();
-        // The payloads move into the arena before they are stored, so the parked bytes are file-backed pages: the
-        // heap copies are freed here and the restore side copies them back.  A full arena refuses the park.
+        // The payloads go to the arena files, so its free space is the second budget: the RAM budget above cannot see
+        // them.  Evict the oldest entries until the incoming payload fits (measured: without this the arena filled up
+        // and every park after it was refused, while the RAM budget never asked for an eviction).
+        if (arena_ != nullptr)
+            while (arena_->stats().free_bytes < n && evict_oldest()) {}
+        // The payloads move into the arena before they are stored: the heap copies are freed here and the restore side
+        // copies them back.  A full arena refuses the park, never the request.
         if (arena_ != nullptr) {
             std::string error;
             if (!conversation_image_to_arena(image, *arena_, error)) {

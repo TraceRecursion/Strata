@@ -9577,8 +9577,11 @@ int main(int argc, char** argv) {
                 if (!strata::core::conversation_snapshot_save(image, view, ss, g, draft0, err,
                         std::move(reuse), &reused_bytes, background ? nullptr : conversation_arena.get(),
                         background ? &park_layer_sink : nullptr, background ? &park_writer : nullptr)) {
+                    // Parking is best effort: a failed build or a full arena skips it, it never fails the request.
+                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (build failed: %s)\n", err.c_str());
+                    err.clear();
                     if (background) park_writer.finish(false);
-                    return false;
+                    return true;
                 }
                 for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
                     auto& st = stages[k];
