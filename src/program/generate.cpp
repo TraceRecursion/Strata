@@ -9402,7 +9402,17 @@ int main(int argc, char** argv) {
                 const bool pageable = o.conversation_cache_admit == "commit";
                 const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
                 const size_t retained = reuse.bytes() + stage_retained;
-                const size_t additional = estimate > retained ? estimate - retained : 0;
+                size_t additional = estimate > retained ? estimate - retained : 0;
+                // --conversation-cache-dir: each layer's K/V goes straight into the arena files as it is built, so
+                // the gate only has to cover the checkpoint metadata.  Counting the whole estimate evicted parked
+                // conversations for bytes that never charge commit (measured: a 454k-token park evicted two, and
+                // the read after it fell to 12.9 tok/s).
+                if (conversation_arena) {
+                    size_t meta = 0;
+                    if (strata::core::conversation_snapshot_metadata_bytes(view, ss, g, draft0, meta, err))
+                        additional = std::min(additional, meta);
+                    err.clear();
+                }
                 // The admission gate: the incoming snapshot has to fit beside the floor.  make_room() above
                 // only balanced the cache's own budget, so a full cache leaves this one short even though
                 // every parked conversation could give its memory back - and refusing here throws away the
@@ -9449,7 +9459,7 @@ int main(int argc, char** argv) {
                 strata::core::SavedConversation image;
                 size_t reused_bytes = 0;
                 if (!strata::core::conversation_snapshot_save(image, view, ss, g, draft0, err,
-                        std::move(reuse), &reused_bytes)) return false;
+                        std::move(reuse), &reused_bytes, conversation_arena.get())) return false;
                 for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
                     auto& st = stages[k];
                     const strata::core::OnDevice on(st->dev);
@@ -9457,7 +9467,7 @@ int main(int argc, char** argv) {
                     const strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached};
                     strata::core::SavedConversation part;
                     if (!strata::core::conversation_snapshot_save(part, view_k, st->ss, g, draft_of(k), err,
-                            std::move(stage_reuse[k]), &reused_bytes))
+                            std::move(stage_reuse[k]), &reused_bytes, conversation_arena.get()))
                         return false;
                     image.stage_images.push_back(std::move(part));
                 }
