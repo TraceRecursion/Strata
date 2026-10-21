@@ -24,6 +24,12 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#ifdef _WIN32
+namespace {
+// The bench and parity tools set environment variables the Linux way; Windows spells it _putenv_s.
+int setenv(const char* name, const char* value, int) { return _putenv_s(name, value); }
+}  // namespace
+#endif
 #include <cstring>
 #include <limits>
 #include <string>
