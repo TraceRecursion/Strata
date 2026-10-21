@@ -2,23 +2,24 @@
 
 ## Status
 
-M1 and M2 are implemented on the `cache-arena` branch: the arena, the copy in and out, the cache hooks and the
-tests.  Measured on this PC through the real server (9k-token conversation, 375 MB): park 93 ms on the heap and
-223 ms with the arena, restore 46 ms, and the second request for the parked conversation was served in 0.4 s with
-9054 cached prompt tokens.  M3 (entry descriptors, so a restarted engine adopts parked conversations instead of
-reclaiming the space) is not implemented: a restart wipes the table.
+Implemented on the `cache-arena` branch and running on this PC: the arena (unbuffered files, extent table,
+identity, eviction on its own free space), the streaming park on one writer thread, the park's layers handed over
+from the build, and parallel restore reads.
+
+Measured on this PC (short chat, a 257k-token prompt, then the same prompt again):
+  * a restore of 2.85 GB takes 1.7 s (1.67 GB/s), against 150-330 MB/s for the serial read it replaced - a 330k-token
+    conversation (about 6 GB) used to take 20-38 s;
+  * the park's synchronous build is 3.4-4.3 s at 257k tokens (0.04 s at 66 tokens) and lands on the request that
+    follows the switched-away conversation;
+  * the writer's copy is 28.7 s for 4.1 GB - the single-volume unbuffered write rate, because the files are opened
+    synchronously; a parallel write with overlapped handles was tried and crashed, so it is left for a dedicated pass;
+  * a request arriving while the writer is busy skips its park (logged) instead of paying a synchronous one;
+  * the cache's RAM budget (--conversation-cache-mib) covers the checkpoint metadata and the materialized transient
+    of a restore, so the launcher asks for 8192 MiB.
 
 One warning for anyone changing `ConversationBuffer` or `ConversationKv`: do a **clean** rebuild.  An incremental
 build that keeps one stale object file compiled against the old layout crashes the park path with 0xC0000005
 (both a changed segment type and an added field did it, and a clean rebuild fixed both).
-
-
-Status: **design only**, nothing of it is implemented. The measurements below were taken on this PC (Windows 11,
-RTX 5080, 62.6 GiB RAM, five Intel Optane M10 16 GB modules mounted at `C:\OptanePagefiles\{1..5}`, 12.4 GB
-usable each), with the page files shrunk to 4 GiB each so 9.4 GB per volume was free. The tool was a ctypes
-harness using `CreateFileW` with `FILE_FLAG_NO_BUFFERING` (and `FILE_FLAG_WRITE_THROUGH` for writes), 16 MiB
-sequential blocks and 4 KiB random blocks; every temporary file was deleted afterwards.
-
 ## The problem it solves
 
 Parked conversations (`--conversation-cache-mib`, the `SavedConversation` images in
