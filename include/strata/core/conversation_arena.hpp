@@ -65,7 +65,11 @@ public:
     /// the same volume at once (the serial read() takes the arena's one bounce buffer, so it cannot).
     bool read_positioned(const ArenaExtent& extent, uint64_t offset_in_extent, uint8_t* dst, size_t bytes,
                          uint8_t* bounce);
-    /// A 16 MiB page-aligned bounce buffer for read_positioned; nullptr on failure.  free_bounce() releases it.
+    /// The write side of read_positioned: a caller-owned bounce buffer and positioned I/O.
+    bool write_positioned(const ArenaExtent& extent, uint64_t offset_in_extent, const uint8_t* src, size_t bytes,
+                          uint8_t* bounce);
+    /// A 16 MiB page-aligned bounce buffer for read_positioned/write_positioned; nullptr on failure.  free_bounce()
+    /// releases it.
     static void* alloc_bounce();
     static void free_bounce(void* bounce);
     Stats stats() const;

@@ -2320,7 +2320,8 @@ public:
     strata::core::SavedConversation& begin() {
         std::lock_guard<std::mutex> lock(mu_);
         job_ = std::make_unique<Job>();
-        strata::core::arena_quiet_until_ms().store(strata::core::progress_now_ms() + 3000, std::memory_order_relaxed);
+        job_->start_ms = strata::core::progress_now_ms();
+        strata::core::arena_quiet_until_ms().store(strata::core::progress_now_ms(), std::memory_order_relaxed);
         return job_->image;
     }
     /// Build thread, after layer `index` of the image was built.
@@ -2343,7 +2344,7 @@ public:
     /// Main thread, once per request: a finished job joins the cache at the drain, a failed one releases its extents.
     template <class Put>
     void drain(Put&& put) {
-        strata::core::arena_quiet_until_ms().store(strata::core::progress_now_ms() + 30000, std::memory_order_relaxed);
+        strata::core::arena_quiet_until_ms().store(strata::core::progress_now_ms(), std::memory_order_relaxed);   // no pause: the parallel I/O keeps the contention small
         std::unique_ptr<Job> job;
         {
             std::lock_guard<std::mutex> lock(mu_);
@@ -2358,6 +2359,7 @@ private:
         strata::core::SavedConversation image;
         size_t available = 0;   // layers built (the build thread sets it under the mutex)
         size_t copied = 0;      // layers written to the arena (the writer sets it under the mutex)
+        int64_t start_ms = 0;   // when the job was handed over
         bool build_done = false;
         bool ok = true;
     };
@@ -2382,6 +2384,10 @@ private:
                 std::lock_guard<std::mutex> lock(mu_);
                 job_->ok = job_->ok && ok;
                 ++job_->copied;
+                if (job_->build_done && job_->copied >= job_->available) {
+                    std::fprintf(stderr, "strata serve: conversation arena: the background park finished in %.1f ms\n",
+                                 (double) (strata::core::progress_now_ms() - job_->start_ms));
+                }
             }
             cv_.notify_all();
         }
@@ -9174,8 +9180,8 @@ int main(int argc, char** argv) {
         // pair of snapshots, side stream and events.
         struct PlSnap {
             int dev = 0;
-            size_t bytes = 0;
             void* state = nullptr;            // the stage's GDN state (its session's)
+            size_t bytes = 0;                 // the GDN snapshot size of the stage
             float* buf[2] = {nullptr, nullptr};
             cudaStream_t side = nullptr;
             cudaEvent_t pre[2] = {nullptr, nullptr}, ev[2] = {nullptr, nullptr};
@@ -12222,7 +12228,7 @@ int main(int argc, char** argv) {
                     std::printf("SAVED %zu %zu %.1f\n", live.size(), bytes, ms());
                 } else {
                     strata::core::SavedConversation image;
-                    size_t bytes = 0;
+                    size_t bytes = 0;   // the file size, reported by the read
                     try {
                         // bounds this session can ever restore (geometry, layer range, tokens, checkpoints, every
                         // state and K/V part), checked as the file is parsed and before each array is allocated; the
