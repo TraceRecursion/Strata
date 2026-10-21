@@ -2346,7 +2346,7 @@ public:
     void drain(Put&& put) {
         // A request gets the devices for two seconds: enough for a restore to read its image without the
         // background writer in front of it, short enough that a park is not starved by a busy server.
-        strata::core::arena_quiet_until_ms().store(strata::core::progress_now_ms() + 2000, std::memory_order_relaxed);
+        strata::core::arena_quiet_until_ms().store(strata::core::progress_now_ms() + 4000, std::memory_order_relaxed);
         std::unique_ptr<Job> job;
         {
             std::lock_guard<std::mutex> lock(mu_);
@@ -15423,6 +15423,21 @@ int main(int argc, char** argv) {
                         (long long) req_offload, chain_txt, (long long) req_chunk,
                         (long long) (sp.chain_experts_streamed() - streamed0));
             std::fflush(stdout);
+            // --conversation-cache-dir: park here, while the client reads the reply, instead of at the next
+            // request (the park build is 3-4 s on a 257k conversation and used to land there).  The writer takes
+            // the arena copy; --conversation-cache-park-gain keeps this from rebuilding the snapshot every turn.
+            if (conversation_arena != nullptr && conversations.enabled() && live_ok && !live.empty() && !geni &&
+                admit_slot < 0 && req_ckpt != 0) {
+                const size_t eager_held =
+                    o.conversation_cache_park_gain > 0
+                        ? conversations.parked_prefix_tokens(live, live_imgs, checks, cvec_cached)
+                        : 0;
+                const bool eager_worth =
+                    o.conversation_cache_park_gain <= 0 || eager_held == 0 ||
+                    (int64_t) live.size() >= (int64_t) eager_held + o.conversation_cache_park_gain;
+                if (eager_worth && !park_current(0))
+                    std::fprintf(stderr, "strata serve: conversation cache: the eager park failed; the next park skips\n");
+            }
             if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
                 bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
                             (int64_t) live.size() == p;
