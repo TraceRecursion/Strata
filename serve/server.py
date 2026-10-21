@@ -743,6 +743,9 @@ class ConvCacheLog:
     EVENT = re.compile(r"conversation cache: (parked|skipped|restored) (\d+) tokens.*?parked=(\d+) bytes=(\d+)"
                        r"(?: evictions=(\d+))?")
     DROPPED = re.compile(r"conversation cache: dropped \d+ superseded .*?parked=(\d+)")
+    # the writer's completion line: an entry that was streaming into the arena joins the cache (the parked/bytes are
+    # the post-put counts, so the card catches up at the request that drains it)
+    STORED = re.compile(r"conversation cache: the background park stored \d+ MiB; parked=(\d+) bytes=(\d+)")
     READ_MAX = 1 << 20                                  # at most the last MiB of new lines per read
 
     def __init__(self):
@@ -790,6 +793,9 @@ class ConvCacheLog:
             m = self.DROPPED.search(line)
             if m:
                 self.state["parked"] = int(m.group(1))
+            m = self.STORED.search(line)
+            if m:
+                self.state["parked"], self.state["bytes"] = int(m.group(1)), int(m.group(2))
         return dict(self.state)
 
 

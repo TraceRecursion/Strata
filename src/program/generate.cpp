@@ -9750,9 +9750,11 @@ int main(int argc, char** argv) {
                 if (background) {
                     park_writer.finish(true);
                     std::fprintf(stderr, "strata serve: conversation cache: parked %zu tokens: the arena copy streams on "
-                                         "the background writer (%zu MiB, built in %.1f ms, %zu parked now)\n",
+                                         "the background writer (%zu MiB, built in %.1f ms, %zu parked now); "
+                                         "parked=%zu bytes=%zu\n",
                                  live.size(), snapshot_bytes >> 20,
-                                 std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), conversations.size());
+                                 std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                                 conversations.size(), conversations.size(), conversations.bytes());
                     return true;
                 }
                 const bool stored = conversations.put(std::move(image), held);
@@ -12844,8 +12846,13 @@ int main(int argc, char** argv) {
             // start of this prompt wins as before)
             bool borrow = stages.empty() && parked.tokens > std::max(resume, slot_tokens) &&
                           conversations.borrows(parked);
-            if (parked.tokens > std::max(resume, slot_tokens) && !borrow)
+            if (parked.tokens > std::max(resume, slot_tokens) && !borrow) {
+                // The restore reads its image from the arena: keep the background writer off the devices while it does
+                // (measured: a 226 MiB restore took 6.5 s behind a 4 GB park write, 87 ms with the devices free).
+                strata::core::arena_quiet_until_ms().store(strata::core::progress_now_ms() + 6000,
+                                                           std::memory_order_relaxed);
                 incoming.emplace(conversations.take(parked.index));
+            }
             if (incoming || borrow) slot_source = -1;
             // Reject the entire image before parking/overwriting the outgoing
             // state. Invalid entries can safely fall back to its existing prefix.
@@ -12916,8 +12923,11 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: conversation cache: no room beside the parked conversation "
                                          "this request starts with; taking it instead of borrowing\n");
                     borrow = false;
-                    if (const size_t at = conversations.index_of(parked.serial); at != SIZE_MAX)
+                    if (const size_t at = conversations.index_of(parked.serial); at != SIZE_MAX) {
+                        strata::core::arena_quiet_until_ms().store(strata::core::progress_now_ms() + 6000,
+                                                                   std::memory_order_relaxed);
                         incoming.emplace(conversations.take(at));
+                    }
                     if (!park_current(incoming ? incoming->bytes() : 0)) {
                         std::printf("ERR %s\n", err.c_str());
                         return 1;
