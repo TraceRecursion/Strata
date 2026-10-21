@@ -9543,11 +9543,10 @@ int main(int argc, char** argv) {
                              live.size(), (long long) o.conversation_cache_min_tokens, conversations.size());
                 return true;
             }
-            // #342: before make_room evicts oldest-first, the copies of this conversation a turn back go (they hold
-            // nothing the outgoing chain does not, apart from the tail this conversation rewrote)
-            if (const size_t dropped = conversations.drop_superseded(live, live_imgs, checks, cvec_cached))
-                std::fprintf(stderr, "strata serve: conversation cache: dropped %zu superseded cop%s of this "
-                             "conversation; parked=%zu\n", dropped, dropped == 1 ? "y" : "ies", conversations.size());
+            // #342: the copies of this conversation a turn back are superseded by this snapshot.  They are dropped
+            // just before an admission would otherwise evict other conversations (see the gate below), not here: with
+            // room to spare they stay in the cache until put() supersedes them, so a switch that arrives while the
+            // arena copy streams still finds them instead of reading the prompt again.
             // A layer split parks one image per stage: the first stage's (with the draft layer's K/V) and one per
             // later stage (without it - the draft ring is saved once).  The checkpoints are MOVED apart into their
             // stage parts for the capture and put back together whichever way this ends (no running state copied).
@@ -9671,6 +9670,17 @@ int main(int argc, char** argv) {
                     return strata::core::conversation_memory_admit(
                         mem ? std::optional<uint64_t>(mem->available) : std::nullopt, additional, floor);
                 };
+                // #342: this conversation's own copies a turn back are the first thing to go when the snapshot would
+                // not be admitted - they hold nothing the outgoing chain does not (apart from the tail it rewrote), so
+                // dropping them beats evicting another conversation.  When the gates are not short they stay: put()
+                // supersedes them once the new copy is in, and until then a switch can still hit them.
+                const bool arena_short =
+                    conversation_arena != nullptr && conversation_arena->stats().free_bytes < estimate;
+                if ((arena_short || !admit()) &&
+                    conversations.drop_superseded(live, live_imgs, checks, cvec_cached) > 0)
+                    std::fprintf(stderr, "strata serve: conversation cache: dropped the superseded copies of this "
+                                         "conversation (an admission was short); parked=%zu\n",
+                                 conversations.size());
                 while (!admit() && conversations.size() > 0 && evicted < conversations.slots() &&
                        conversations.evict_oldest())
                     ++evicted;
