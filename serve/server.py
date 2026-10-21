@@ -746,6 +746,10 @@ class ConvCacheLog:
     # the writer's completion line: an entry that was streaming into the arena joins the cache (the parked/bytes are
     # the post-put counts, so the card catches up at the request that drains it)
     STORED = re.compile(r"conversation cache: the background park stored \d+ MiB; parked=(\d+) bytes=(\d+)")
+    # the arena's own space: the engine prints it on every park ("arena_used=B arena_free=B") and at start
+    # ("conversation arena: N volume(s), X MiB in use, Y MiB free")
+    ARENA = re.compile(r"arena_used=(\d+) arena_free=(\d+)")
+    ARENA_START = re.compile(r"conversation arena: (\d+) volume\(s\), (\d+) MiB in use, (\d+) MiB free")
     READ_MAX = 1 << 20                                  # at most the last MiB of new lines per read
 
     def __init__(self):
@@ -754,7 +758,8 @@ class ConvCacheLog:
 
     def reset(self):
         self.state = {"parked": 0, "bytes": 0, "evictions": 0, "parks": 0, "restores": 0, "last_event": None,
-                      "last_tokens": None, "last_at": None}
+                      "last_tokens": None, "last_at": None,
+                      "arena_used": None, "arena_free": None, "arena_volumes": None}
 
     def poll(self, path, start) -> dict:
         """The state after the log's new lines; `start` is where the engine's current run began in it."""
@@ -778,6 +783,13 @@ class ConvCacheLog:
         self.pos += end
         now = time.time()
         for line in data[:end].decode("utf-8", "replace").splitlines():
+            m = self.ARENA_START.search(line)
+            if m:
+                self.state["arena_volumes"] = int(m.group(1))
+                self.state["arena_used"], self.state["arena_free"] = int(m.group(2)) << 20, int(m.group(3)) << 20
+            m = self.ARENA.search(line)
+            if m:
+                self.state["arena_used"], self.state["arena_free"] = int(m.group(1)), int(m.group(2))
             if "conversation cache:" not in line:
                 continue
             m = self.EVENT.search(line)
@@ -814,11 +826,18 @@ def conversation_slots(engine) -> int | None:
 
 def conversation_cache_view(info: dict, hist: list, totals: dict, parked: dict) -> dict:
     """#596: the Monitor's Conversation cache card: the parked conversations (the engine's opt-in
-    --conversation-cache-mib: budget, slots, what its log says) and how much of the prompts the cache gave back."""
+    --conversation-cache-mib: budget, slots, what its log says) and how much of the prompts the cache gave back.
+    With --conversation-cache-dir the payloads live in the arena's files instead of RAM, so the card also carries the
+    arena's own space (`arena_capacity` is the files' total, used + free as the engine reports it)."""
     mib = info.get("conversation_cache_mib")
     last = hist[-1] if hist else None
+    arena_gib = info.get("conversation_cache_arena_gib")
+    used, free = parked.get("arena_used"), parked.get("arena_free")
+    capacity = (used + free) if isinstance(used, int) and isinstance(free, int) and (used + free) > 0 else None
+    if capacity is None and isinstance(arena_gib, int) and arena_gib > 0:
+        capacity = arena_gib << 30
     return {"enabled": isinstance(mib, int) and mib > 0, "budget_mib": mib if isinstance(mib, int) else None,
-            "slots": info.get("conversation_cache_slots"), **parked,
+            "slots": info.get("conversation_cache_slots"), **parked, "arena_capacity": capacity,
             "requests": len(hist), "requests_reused": sum(1 for r in hist if (r.get("reused") or 0) > 0),
             "reused_tokens": totals.get("reused", 0), "prompt_tokens": totals.get("prompt_tokens", 0),
             "last_reused": last.get("reused") if last else None,

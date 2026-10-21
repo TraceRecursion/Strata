@@ -216,6 +216,12 @@ function renderConvCache(c) {
     const budget = c.budget_mib * 1048576;
     $("cc-mem-text").textContent = `${gb(c.bytes)} / ${gb(budget)} GB`;
     $("cc-mem-bar").style.width = pct(c.bytes, budget);
+    const arena = c.arena_capacity;                  // --conversation-cache-dir: the parked payloads' files
+    $("cc-arena-row").hidden = !arena;
+    if (arena) {
+      $("cc-arena-text").textContent = `${gb(c.arena_used || 0)} / ${gb(arena)} GB`;
+      $("cc-arena-bar").style.width = pct(c.arena_used || 0, arena);
+    }
   }
   $("cc-sum").textContent = c.requests ? `${fmt(c.requests_reused)} of ${fmt(c.requests)} requests reused part of their prompt` : "";
   const share = c.prompt_tokens ? ` (${fmt((100 * c.reused_tokens) / c.prompt_tokens)}% of all prompt tokens)` : "";
@@ -224,6 +230,7 @@ function renderConvCache(c) {
     ["Last request", c.last_prompt != null ? `${fmt(c.last_reused || 0)} of ${fmt(c.last_prompt)} prompt tokens reused` : null],
     ["Reused since start", c.requests ? `${fmt(c.reused_tokens)} tokens${share}` : null],
     ["Parked / restored", c.enabled ? `${fmt(c.parks)} / ${fmt(c.restores)}${c.evictions ? ` · ${fmt(c.evictions)} evicted` : ""}` : null],
+    ["Arena (disk)", c.arena_capacity ? `${gb(c.arena_used || 0)} of ${gb(c.arena_capacity)} GB on ${fmt(c.arena_volumes || 0)} volumes` : null],
     ["Last switch", c.enabled ? event : null],
   ]);
   $("cc-note").textContent = c.enabled

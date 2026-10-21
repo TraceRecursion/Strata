@@ -9751,10 +9751,12 @@ int main(int argc, char** argv) {
                     park_writer.finish(true);
                     std::fprintf(stderr, "strata serve: conversation cache: parked %zu tokens: the arena copy streams on "
                                          "the background writer (%zu MiB, built in %.1f ms, %zu parked now); "
-                                         "parked=%zu bytes=%zu\n",
+                                         "parked=%zu bytes=%zu arena_used=%zu arena_free=%zu\n",
                                  live.size(), snapshot_bytes >> 20,
                                  std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
-                                 conversations.size(), conversations.size(), conversations.bytes());
+                                 conversations.size(), conversations.size(), conversations.bytes(),
+                                 conversation_arena ? conversation_arena->stats().used_bytes : 0,
+                                 conversation_arena ? conversation_arena->stats().free_bytes : 0);
                     return true;
                 }
                 const bool stored = conversations.put(std::move(image), held);
@@ -11216,6 +11218,7 @@ int main(int argc, char** argv) {
                         "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
                         "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
+                        "conversation_cache_arena_gib=%lld "
                         "conversation_cache_min_free_mib=%lld conversation_cache_admit=%s "
                         "conversation_cache_min_tokens=%lld tail_role_token=%lld vram_elastic=%d "
                         "prefill_cap=%lld prefill_stages=%d stream_all_min=%lld prefill_pipe=%g%s engine=" STRATA_VERSION "\n",
@@ -11229,6 +11232,7 @@ int main(int argc, char** argv) {
                         (long long) ((o.mmap_experts ? src.resident_bytes() : strata::kernels::cpu::expert_layout().total) >> 20),
                         pool.workers(), o.pcie_frac,
                         o.spec_min_p, (long long) o.conversation_cache_mib, o.conversation_cache_slots,
+                        (long long) o.conversation_cache_arena_gib,
                         (long long) o.conversation_cache_min_free_mib, o.conversation_cache_admit.c_str(),
                         (long long) o.conversation_cache_min_tokens,
                         (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
@@ -12830,12 +12834,16 @@ int main(int argc, char** argv) {
             // (put() only ever runs there); a failed one releases its extents.
             park_writer.drain([&](strata::core::SavedConversation&& image) {
                 const size_t bytes = image.bytes();
-                if (conversations.put(std::move(image)))
-                    std::fprintf(stderr, "strata serve: conversation cache: the background park stored %zu MiB; parked=%zu bytes=%zu\n",
-                                 bytes >> 20, conversations.size(), conversations.bytes());
-                else
+                if (conversations.put(std::move(image))) {
+                    const size_t arena_used = conversation_arena ? conversation_arena->stats().used_bytes : 0;
+                    const size_t arena_free = conversation_arena ? conversation_arena->stats().free_bytes : 0;
+                    std::fprintf(stderr, "strata serve: conversation cache: the background park stored %zu MiB; parked=%zu "
+                                         "bytes=%zu arena_used=%zu arena_free=%zu\n",
+                                 bytes >> 20, conversations.size(), conversations.bytes(), arena_used, arena_free);
+                } else {
                     std::fprintf(stderr, "strata serve: conversation cache: the background park was refused (%zu MiB)\n",
                                  bytes >> 20);
+                }
             });
             const auto parked = conversations.best(ids, req_imgs, want_cvec);
             std::optional<strata::core::SavedConversation> incoming;
