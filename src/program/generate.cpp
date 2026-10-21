@@ -9531,7 +9531,15 @@ int main(int argc, char** argv) {
                 // --conversation-cache-dir: when the writer is free the arena copy runs there, so neither this request
                 // nor the next one waits for the device (measured: 26.8 s for a 257k-token conversation, which used to
                 // land on the next request).  A busy writer falls back to streaming the build into the arena.
-                const bool background = conversation_arena != nullptr && !park_writer.busy() && n_st == 0;
+                // --conversation-cache-dir: when the writer is free the park streams there; while it is still writing a
+                // previous park, skip this one instead of falling back to the synchronous path (measured: 66 tokens took
+                // 3.65 s that way, on the request's path).  The skipped conversation is simply re-read next time.
+                const bool writer_busy = conversation_arena != nullptr && park_writer.busy();
+                if (writer_busy) {
+                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (the background writer is still busy)\n");
+                    return true;
+                }
+                const bool background = conversation_arena != nullptr && n_st == 0;
                 const size_t retained = reuse.bytes() + stage_retained;
                 size_t additional = ram_estimate > retained ? ram_estimate - retained : 0;
                 // The admission gate: the incoming snapshot has to fit beside the floor.  make_room() above
