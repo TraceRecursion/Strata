@@ -2344,7 +2344,9 @@ public:
     /// Main thread, once per request: a finished job joins the cache at the drain, a failed one releases its extents.
     template <class Put>
     void drain(Put&& put) {
-        strata::core::arena_quiet_until_ms().store(strata::core::progress_now_ms(), std::memory_order_relaxed);   // no pause: the parallel I/O keeps the contention small
+        // A request gets the devices for two seconds: enough for a restore to read its image without the
+        // background writer in front of it, short enough that a park is not starved by a busy server.
+        strata::core::arena_quiet_until_ms().store(strata::core::progress_now_ms() + 2000, std::memory_order_relaxed);
         std::unique_ptr<Job> job;
         {
             std::lock_guard<std::mutex> lock(mu_);
