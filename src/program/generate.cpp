@@ -710,6 +710,31 @@ struct Options {
     /// --layer-split auto, run on CUDA0 alone when it holds every profiled expert pair plus the whole session (KV),
     /// the drafter and the reserve - a split then only adds hand-offs (two RDNA4 cards: 1,384 vs 1,794 tok/s at 4K)
     bool split_skip_if_fits = false;
+/// Pages inherit the memory priority of the thread that allocates them.  A parked conversation's bytes are the
+/// coldest thing the engine holds, but the OS sees them as freshly written and would trim the model's pages first
+/// (measured: 12.9-28 tok/s reads after a park).  Allocating them under MEMORY_PRIORITY_LOW - no privilege
+/// needed, unlike the working-set floor - makes the parked pages the ones that page out.
+class LowMemoryPriority {
+public:
+    LowMemoryPriority() {
+        MEMORY_PRIORITY_INFORMATION info{};
+        info.MemoryPriority = MEMORY_PRIORITY_LOW;
+        saved_ok_ = SetThreadInformation(GetCurrentThread(), ThreadMemoryPriority, &info, sizeof info) != 0;
+        saved_ = info;
+    }
+    ~LowMemoryPriority() {
+        if (!saved_ok_) return;
+        MEMORY_PRIORITY_INFORMATION back{};
+        back.MemoryPriority = MEMORY_PRIORITY_NORMAL;
+        SetThreadInformation(GetCurrentThread(), ThreadMemoryPriority, &back, sizeof back);
+    }
+    LowMemoryPriority(const LowMemoryPriority&) = delete;
+    LowMemoryPriority& operator=(const LowMemoryPriority&) = delete;
+private:
+    bool saved_ok_ = false;
+    MEMORY_PRIORITY_INFORMATION saved_{};
+};
+
     /// Plan v0.3 P8: stay resident and take requests on stdin (see the --serve block in main).
     bool serve = false;
     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
@@ -8265,6 +8290,23 @@ int main(int argc, char** argv) {
         return false;
     };
     if (o.serve) {
+        // The parked conversations live in the page files, and a page the OS has just written looks newer than the
+        // engine's own: under pressure it would take the model's pages instead (measured: 12.9-28 tok/s reads after
+        // a park).  A hard working-set floor keeps the engine resident; it needs SeIncreaseQuotaPrivilege, so the
+        // try below is best effort and says so when the launcher did not run elevated.
+        if (const char* wf = std::getenv("STRATA_WS_FLOOR_MIB"); wf != nullptr && std::atoi(wf) > 0) {
+            const SIZE_T floor_mib = (SIZE_T) std::atoi(wf);
+            // Raise the maximum first: a minimum above the process's default maximum is ERROR_INVALID_PARAMETER.
+            SetProcessWorkingSetSizeEx(GetCurrentProcess(), 0, floor_mib << 21, 0);
+            if (SetProcessWorkingSetSizeEx(GetCurrentProcess(), floor_mib << 20, floor_mib << 20,
+                                           0))
+                std::fprintf(stderr, "strata serve: working set floor: %zu MiB pinned (the parked pages page out, "
+                                     "not the model's)\n", floor_mib);
+            else
+                std::fprintf(stderr, "strata serve: working set floor: %zu MiB not set (error %lu: start the "
+                                     "engine elevated for SeIncreaseQuotaPrivilege)\n", floor_mib,
+                             (unsigned long) GetLastError());
+        }
         if (o.spec < 2 || o.prefill_chunk <= 0 ||
             (graph_hits && (thits.d_res == nullptr || host_res.empty()))) {
             std::fprintf(stderr, "strata serve: needs --spec T and --prefill CHUNK (and a fillable "
