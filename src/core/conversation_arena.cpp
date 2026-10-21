@@ -418,22 +418,62 @@ bool conversation_kv_to_arena(ConversationKv& kv, ConversationArena& arena, std:
             parts[i].extents.push_back(extent);
         }
     }
-    // The write is serial: parallel writes measured 140 MB/s against 375 MB/s for this loop (the per-layer task lists
-    // are small and the extra bounce copies and threads cost more than the volumes give back).
-    std::vector<uint8_t> chunk(kChunk);
+    // One worker thread per volume, each using only that volume's handle: concurrent writes on one synchronous handle
+    // serialise (measured 140-156 MB/s), while five streams reach the devices' own write rate.
+    struct Task {
+        const ArenaExtent* extent;
+        uint64_t offset;
+        const uint8_t* src;
+        size_t bytes;
+    };
+    struct Span {
+        const uint8_t* p;
+        size_t len;
+        size_t at;
+    };
+    std::vector<Task> tasks;
+    std::vector<Span> spans;
     for (size_t i = 0; i < 5; ++i) {
+        const size_t total = parts[i].size;
+        if (total == 0) continue;
+        spans.clear();
+        buffers[i]->visit(0, total, [&](uint8_t* p, size_t len, size_t at) {
+            spans.push_back({p, len, at});
+            return true;
+        });
         size_t done = 0;
         for (const auto& extent : parts[i].extents) {
-            const size_t n = std::min((size_t) extent.length, parts[i].size - done);
-            if (!buffers[i]->read(chunk.data(), done, n) || !arena.write(extent, chunk.data(), n)) {
-                release_parts(kv, arena);
-                error = "the snapshot buffer could not be written to the arena";
-                return false;
+            const size_t n = std::min((size_t) extent.length, total - done);
+            const size_t begin = done, end = done + n;
+            for (const auto& span : spans) {
+                const size_t lo = std::max(begin, span.at), hi = std::min(end, span.at + span.len);
+                if (lo >= hi) continue;
+                tasks.push_back({&extent, (uint64_t) (lo - begin), span.p + (lo - span.at), hi - lo});
             }
             done += n;
         }
-        *buffers[i] = ConversationBuffer();
     }
+    std::atomic<bool> failed{false};
+    std::vector<std::thread> pool;
+    pool.reserve(5);
+    for (size_t v = 0; v < 5; ++v) {
+        pool.emplace_back([&, v] {
+            uint8_t* bounce = static_cast<uint8_t*>(ConversationArena::alloc_bounce());
+            if (bounce == nullptr) { failed = true; return; }
+            for (const auto& task : tasks) {
+                if (task.extent->volume != v || failed.load(std::memory_order_relaxed)) continue;
+                if (!arena.write_positioned(*task.extent, task.offset, task.src, task.bytes, bounce)) failed = true;
+            }
+            ConversationArena::free_bounce(bounce);
+        });
+    }
+    for (auto& worker : pool) worker.join();
+    if (failed.load()) {
+        release_parts(kv, arena);
+        error = "the snapshot buffer could not be written to the arena";
+        return false;
+    }
+    for (auto& buffer : buffers) *buffer = ConversationBuffer();
     kv.arena = std::move(parts);
     kv.arena_bytes = 0;
     for (const auto& part : kv.arena) kv.arena_bytes += part.size;
