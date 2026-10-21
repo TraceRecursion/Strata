@@ -61,6 +61,13 @@ public:
     /// Writes `bytes` of `data` into `extent` and reads it back, unbuffered.
     bool write(const ArenaExtent& extent, const uint8_t* data, size_t bytes);
     bool read(const ArenaExtent& extent, uint8_t* data, size_t bytes);
+    /// Reads part of an extent with positioned I/O into a caller-owned bounce buffer: several threads may read
+    /// the same volume at once (the serial read() takes the arena's one bounce buffer, so it cannot).
+    bool read_positioned(const ArenaExtent& extent, uint64_t offset_in_extent, uint8_t* dst, size_t bytes,
+                         uint8_t* bounce);
+    /// A 16 MiB page-aligned bounce buffer for read_positioned; nullptr on failure.  free_bounce() releases it.
+    static void* alloc_bounce();
+    static void free_bounce(void* bounce);
     Stats stats() const;
 
 private:

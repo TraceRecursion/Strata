@@ -8,8 +8,10 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <chrono>
+#include <cstring>
+#include <atomic>
+#include <mutex>
 #include <thread>
 
 #ifdef _WIN32
@@ -154,6 +156,45 @@ bool ConversationArena::write(const ArenaExtent& extent, const uint8_t* data, si
         const size_t len = round_up(n, kPage);   // the device wants whole sectors; the tail is padding
         std::memset(static_cast<uint8_t*>(bounce_) + n, 0, len - n);
         if (!write_raw(extent.volume, extent.offset + done, len)) return false;
+    }
+    return true;
+}
+
+void* ConversationArena::alloc_bounce() {
+#ifdef _WIN32
+    return _aligned_malloc(kBounce, kPage);
+#else
+    return std::aligned_alloc(kPage, kBounce);
+#endif
+}
+
+void ConversationArena::free_bounce(void* bounce) {
+    if (bounce == nullptr) return;
+#ifdef _WIN32
+    _aligned_free(bounce);
+#else
+    std::free(bounce);
+#endif
+}
+
+bool ConversationArena::read_positioned(const ArenaExtent& extent, uint64_t offset_in_extent, uint8_t* dst,
+                                        size_t bytes, uint8_t* bounce) {
+    if (bounce == nullptr || dst == nullptr || bytes == 0 || offset_in_extent + bytes > extent.length) return false;
+    if (extent.volume >= files_.size() || file_state_[extent.volume].fail) return false;
+    const uint64_t at = extent.offset + offset_in_extent;
+    for (size_t done = 0; done < bytes; done += std::min(bytes - done, kBounce)) {
+        const size_t n = std::min(bytes - done, kBounce);
+        const size_t len = round_up(n, kPage);
+#ifdef _WIN32
+        OVERLAPPED ov{};
+        ov.Offset = (DWORD) ((at + done) & 0xFFFFFFFFull);
+        ov.OffsetHigh = (DWORD) ((at + done) >> 32);
+        DWORD got = 0;
+        if (!ReadFile(files_[extent.volume]->handle, bounce, (DWORD) len, &got, &ov) || got != len) return false;
+#else
+        if (pread(files_[extent.volume]->fd, bounce, len, (off_t) (at + done)) != (ssize_t) len) return false;
+#endif
+        std::memcpy(dst + done, bounce, n);
     }
     return true;
 }
@@ -384,21 +425,69 @@ bool conversation_kv_to_arena(ConversationKv& kv, ConversationArena& arena, std:
 bool conversation_kv_from_arena(ConversationKv& kv, ConversationArena& arena, std::string& error) {
     if (kv.arena_bytes == 0) return true;
     FiveBuffers buffers = five(kv);
-    std::vector<uint8_t> chunk(kChunk);
+    // The restore is the slow side of the arena (a 330k-token conversation materialises ~6 GB), so its extents are
+    // read in parallel: one task per (extent, destination span), each worker with its own bounce buffer.  The
+    // destination ranges are disjoint, so no lock is needed on the image.
+    struct Task {
+        const ArenaExtent* extent;
+        uint64_t offset;   // inside the extent
+        uint8_t* dst;
+        size_t bytes;
+    };
+    struct Span {
+        uint8_t* p;
+        size_t len;
+        size_t at;
+    };
+    std::vector<Task> tasks;
+    std::vector<Span> spans;
     for (size_t i = 0; i < 5; ++i) {
         const size_t total = kv.arena[i].size;
         if (total == 0) { buffers[i]->resize(0); continue; }
         buffers[i]->resize(total, 0);
+        spans.clear();
+        buffers[i]->visit(0, total, [&](uint8_t* p, size_t len, size_t at) {
+            spans.push_back({p, len, at});
+            return true;
+        });
         size_t done = 0;
         for (const auto& extent : kv.arena[i].extents) {
             const size_t n = std::min((size_t) extent.length, total - done);
-            if (!arena.read(extent, chunk.data(), n)) { error = "the arena could not be read"; return false; }
-            buffers[i]->visit(done, n, [&](uint8_t* p, size_t len, size_t at) {
-                std::memcpy(p, chunk.data() + (at - done), len);
-                return true;
-            });
+            const size_t begin = done, end = done + n;
+            for (const auto& span : spans) {
+                const size_t lo = std::max(begin, span.at), hi = std::min(end, span.at + span.len);
+                if (lo >= hi) continue;
+                tasks.push_back({&extent, (uint64_t) (lo - begin), span.p + (lo - span.at), hi - lo});
+            }
             done += n;
         }
+    }
+    std::atomic<size_t> next{0};
+    std::atomic<bool> failed{false};
+    std::mutex error_mu;
+    std::string first_error;
+    const size_t workers = std::min<size_t>(8, std::max<size_t>(1, tasks.size()));
+    std::vector<std::thread> pool;
+    pool.reserve(workers);
+    for (size_t w = 0; w < workers; ++w) {
+        pool.emplace_back([&] {
+            uint8_t* bounce = static_cast<uint8_t*>(ConversationArena::alloc_bounce());
+            if (bounce == nullptr) { failed = true; return; }
+            for (size_t k = next++; k < tasks.size() && !failed.load(std::memory_order_relaxed); k = next++) {
+                const Task& task = tasks[k];
+                if (!arena.read_positioned(*task.extent, task.offset, task.dst, task.bytes, bounce)) {
+                    std::lock_guard<std::mutex> lock(error_mu);
+                    if (first_error.empty()) first_error = "the arena could not be read";
+                    failed = true;
+                }
+            }
+            ConversationArena::free_bounce(bounce);
+        });
+    }
+    for (auto& worker : pool) worker.join();
+    if (failed.load()) {
+        error = first_error.empty() ? "the arena could not be read" : first_error;
+        return false;
     }
     release_parts(kv, arena);
     return true;
