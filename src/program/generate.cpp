@@ -9571,6 +9571,25 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: conversation cache: evicted %zu parked conversation%s to admit this snapshot (%s admission, %zu MiB plus %lld MiB floor)\n",
                                  evicted, evicted == 1 ? "" : "s", pageable ? "commit" : "physical RAM",
                                  additional >> 20, (long long) o.conversation_cache_min_free_mib);
+                // The arena's free space is the third gate: evict the oldest parked conversations until this snapshot
+                // fits there (the RAM budgets cannot see the payloads).  Without it a full arena made every later park
+                // skip with "build failed: the arena is full" (measured five times in one session).
+                if (conversation_arena != nullptr) {
+                    size_t arena_evicted = 0;
+                    while (conversation_arena->stats().free_bytes < estimate && conversations.evict_oldest())
+                        ++arena_evicted;
+                    const size_t arena_free = conversation_arena->stats().free_bytes;
+                    if (arena_free < estimate) {
+                        std::fprintf(stderr, "strata serve: conversation cache: skip parking (the arena has %zu MiB free, "
+                                             "the snapshot needs %zu MiB)\n",
+                                     arena_free >> 20, estimate >> 20);
+                        return true;
+                    }
+                    if (arena_evicted)
+                        std::fprintf(stderr, "strata serve: conversation cache: evicted %zu for the arena (%zu MiB free, "
+                                             "snapshot %zu MiB)\n",
+                                     arena_evicted, arena_free >> 20, estimate >> 20);
+                }
                 strata::core::SavedConversation local_image;
                 strata::core::SavedConversation& image = background ? park_writer.begin() : local_image;
                 size_t reused_bytes = 0;
