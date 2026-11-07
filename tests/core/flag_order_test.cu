@@ -6,6 +6,9 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#if defined(_WIN32)
+#include <intrin.h>
+#endif
 #include <thread>
 
 using strata::core::FlagRaise;
@@ -28,7 +31,14 @@ __global__ void consumer(volatile uint32_t* flag, uint32_t want, volatile uint32
     *seen = *staging;        // what the graph's PCIe group would read
 }
 
-static uint32_t rd(volatile uint32_t* p) { return __atomic_load_n((uint32_t*) p, __ATOMIC_SEQ_CST); }
+static uint32_t rd(volatile uint32_t* p) {
+#if defined(_WIN32)   // MSVC has no __atomic builtins; the same full-barrier read with intrin.h (as flag_order.hpp)
+    volatile long* f = (volatile long*) p;
+    return (uint32_t) _InterlockedCompareExchange(f, 0, 0);
+#else
+    return __atomic_load_n((uint32_t*) p, __ATOMIC_SEQ_CST);
+#endif
+}
 
 static int run_device(int dev) {
     CK(cudaSetDevice(dev));
